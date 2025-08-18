@@ -1,0 +1,21 @@
+# cria as novas tabelas (acontece automaticamente ao rodar qualquer comando)
+python manage_users.py list
+
+# cadastrar usuário com 2 invoices
+python manage_users.py add --cpf 01326303627 --nome "Janaina" --invoice 1001 --invoice 1002
+# (ou) python manage_users.py add --cpf 01326303627 --nome "Janaina" --invoice 1001,1002
+
+# listar usuários já com os invoices
+python manage_users.py list
+
+# adicionar mais um invoice depois
+python manage_users.py invoices add --cpf 01326303627 --invoice 1003
+
+# listar invoices de um usuário
+python manage_users.py invoices list --cpf 01326303627
+
+# remover um invoice específico
+python manage_users.py invoices del --cpf 01326303627 --invoice 1002
+
+#resetar senha para o cpf
+python manage_users.py reset --cpf 01326303627
