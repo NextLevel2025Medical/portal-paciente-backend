@@ -16,6 +16,7 @@ DB_URL = f"sqlite:///{(BASE_DIR / 'app.db').as_posix()}"
 
 engine = create_engine(DB_URL, echo=False, connect_args={"check_same_thread": False})
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SELLERS = ("Johnny", "Ana Maria", "Carolina")  # << NOVO
 
 # Ativa FKs no SQLite
 @event.listens_for(Engine, "connect")
@@ -32,6 +33,7 @@ class User(SQLModel, table=True):
     cpf: str = Field(primary_key=True, index=True)
     nome: str
     password_hash: str = Field(sa_column=Column("password", String, nullable=False))
+    vendedor: Optional[str] = None   # << NOVO
 
 class Invoice(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("cpf", "invoice_id", name="uq_invoice_per_user"),)
@@ -126,7 +128,8 @@ def parse_invoices(args_invoices: Optional[Iterable[str]]) -> list[str]:
 
 # ====== Ações de usuário ======
 def add_user(cpf: str, nome: str, senha: Optional[str] = None,
-             overwrite: bool = False, invoices: Optional[list[str]] = None) -> None:
+             overwrite: bool = False, invoices: Optional[list[str]] = None,
+             vendedor: Optional[str] = None) -> None:
     cpf_n = so_digitos(cpf)
     if not cpf_n:
         print("CPF inválido.")
@@ -143,6 +146,8 @@ def add_user(cpf: str, nome: str, senha: Optional[str] = None,
         if u and overwrite:
             u.nome = nome or u.nome
             u.password_hash = hash_pwd(senha_final)
+            if vendedor in SELLERS:
+                u.vendedor = vendedor                   # << NOVO
             s.add(u)
             # adiciona invoices novos (sem duplicar)
             for inv in invoices:
@@ -153,7 +158,8 @@ def add_user(cpf: str, nome: str, senha: Optional[str] = None,
             s.commit()
             print(f"Atualizado: {cpf_n} (senha redefinida) — invoices adicionados (se houver).")
         else:
-            novo = User(cpf=cpf_n, nome=nome, password_hash=hash_pwd(senha_final))
+            novo = User(cpf=cpf_n, nome=nome, password_hash=hash_pwd(senha_final),
+                        vendedor=(vendedor if vendedor in SELLERS else None))  # << NOVO
             s.add(novo)
             s.commit()
             # adiciona invoices
@@ -194,7 +200,7 @@ def list_users():
                 inv_ids = list(invs)
 
             inv_str = ", ".join(inv_ids) if inv_ids else "—"
-            print(f"- {u.cpf} | {u.nome} | invoices: {inv_str}")
+            print(f"- {u.cpf} | {u.nome} |  vendedor: {u.vendedor or '—'} | invoices: {inv_str}")
 
 def delete_user(cpf: str) -> None:
     cpf_n = so_digitos(cpf)
@@ -203,13 +209,37 @@ def delete_user(cpf: str) -> None:
         if not u:
             print("CPF não encontrado.")
             return
-        # invoices com FK e ON DELETE RESTRICT por padrão;
-        # apagamos explicitamente para manter simples:
-        s.exec(select(Invoice).where(Invoice.cpf == cpf_n))
-        s.query(Invoice).filter(Invoice.cpf == cpf_n).delete()  # type: ignore
+        s.exec(delete(Invoice).where(Invoice.cpf == cpf_n))  # apaga invoices vinculados
         s.delete(u)
         s.commit()
         print(f"Removido: {cpf_n} (e seus invoices)")
+
+def set_seller(cpf: str, vendedor: str) -> None:
+    cpf_n = so_digitos(cpf)
+    if vendedor not in SELLERS:
+        print(f"Vendedor inválido. Use um de: {', '.join(SELLERS)}")
+        return
+    with Session(engine) as s:
+        u = get_user(s, cpf_n)
+        if not u:
+            print("CPF não encontrado.")
+            return
+        u.vendedor = vendedor
+        s.add(u)
+        s.commit()
+        print(f"Vendedor de {cpf_n} definido para: {vendedor}")
+
+def clear_seller(cpf: str) -> None:
+    cpf_n = so_digitos(cpf)
+    with Session(engine) as s:
+        u = get_user(s, cpf_n)
+        if not u:
+            print("CPF não encontrado.")
+            return
+        u.vendedor = None
+        s.add(u)
+        s.commit()
+        print(f"Vendedor de {cpf_n} removido (None)")
 
 # ====== Ações de invoices ======
 def add_invoice(cpf: str, invoice_id: str) -> None:
@@ -270,6 +300,7 @@ if __name__ == "__main__":
     a.add_argument("--overwrite", action="store_true", help="Atualiza se já existir")
     a.add_argument("--invoice", action="append",
                    help="Pode repetir a opção ou passar lista separada por vírgula")
+    a.add_argument("--vendedor", choices=SELLERS, help="(Opcional) Vendedor vinculado")  # << NOVO
 
     r = sub.add_parser("reset", help="Resetar senha para CPF (ou nova senha)")
     r.add_argument("--cpf", required=True)
@@ -312,17 +343,32 @@ if __name__ == "__main__":
     inv_del = inv_sub.add_parser("del", help="Remover um invoice específico")
     inv_del.add_argument("--cpf", required=True)
     inv_del.add_argument("--invoice", required=True)
+    
+    seller = sub.add_parser("seller", help="Gerenciar vendedor do usuário")
+    seller_sub = seller.add_subparsers(dest="scmd", required=True)
+
+    seller_set = seller_sub.add_parser("set", help="Definir vendedor")
+    seller_set.add_argument("--cpf", required=True)
+    seller_set.add_argument("--vendedor", required=True, choices=SELLERS)
+
+    seller_clear = seller_sub.add_parser("clear", help="Remover vendedor")
+    seller_clear.add_argument("--cpf", required=True)
 
     args = p.parse_args()
 
     if args.cmd == "add":
-        add_user(args.cpf, args.nome, args.senha, args.overwrite, parse_invoices(args.invoice))
+        add_user(args.cpf, args.nome, args.senha, args.overwrite, parse_invoices(args.invoice), args.vendedor)
     elif args.cmd == "reset":
         reset_password(args.cpf, args.senha)
     elif args.cmd == "list":
         list_users()
     elif args.cmd == "delete":
         delete_user(args.cpf)
+    elif args.cmd == "seller":                               # << NOVO
+        if args.scmd == "set":
+            set_seller(args.cpf, args.vendedor)
+        elif args.scmd == "clear":
+            clear_seller(args.cpf)
     elif args.cmd == "invoices":
         if args.icmd == "add":
             add_invoice(args.cpf, args.invoice)
