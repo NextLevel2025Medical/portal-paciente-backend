@@ -1079,9 +1079,8 @@ def summary(
     # ======= AGENDAMENTOS (reais, janela curta por padrão) =======
     # ======= AGENDAMENTOS (ano inteiro costurado em janelas <= 180d) =======
     try:
-        today = date.today()
-        start = date(today.year, 1, 1)
-        end   = date(today.year, 12, 31)
+        start = date(2020, 1, 1)
+        end   = date(2030, 12, 31)
         stitched = feegow.get_appointments_range_hydrated(patient_id, start, end)
         data["agendamentos"] = stitched["items"]  # já vem com nomes traduzidos
         if debug:
