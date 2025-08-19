@@ -15,6 +15,17 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_URL = f"sqlite:///{(BASE_DIR / 'app.db').as_posix()}"
 
 engine = create_engine(DB_URL, echo=False, connect_args={"check_same_thread": False})
+
+# garante a coluna 'vendedor' existir na tabela 'user'
+def ensure_user_vendedor_column():
+    from sqlalchemy import text
+    with engine.connect() as con:
+        cols = [r[1] for r in con.exec_driver_sql("PRAGMA table_info(user)").fetchall()]
+        if "vendedor" not in cols:
+            con.exec_driver_sql("ALTER TABLE user ADD COLUMN vendedor TEXT")
+
+ensure_user_vendedor_column()
+
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SELLERS = ("Johnny", "Ana Maria", "Carolina")  # << NOVO
 
