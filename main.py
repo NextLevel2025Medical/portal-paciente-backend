@@ -2,16 +2,22 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Optional
 import os
 import httpx
 from dotenv import load_dotenv
 from datetime import date, timedelta, datetime
 from calendar import monthrange
 from sqlmodel import SQLModel, Field, Session, select, create_engine
-from sqlalchemy import String, Column
+from sqlalchemy import String, Column, text
 from passlib.context import CryptContext
 import re
+
+SELLER_WA = {
+    "Johnny":   "5531985252115",
+    "Ana Maria":"553172631346",
+    "Carolina": "553195426283",
+}
 
 # ------------------------------------------------------------------
 # Carrega variáveis do .env (FEEGOW_BASE, FEEGOW_TOKEN, etc.)
@@ -48,6 +54,7 @@ class User(SQLModel, table=True):
     nome: str
     # importante: mapear para a COLUNA "password" do banco
     password_hash: str = Field(sa_column=Column("password", String, nullable=False))
+    vendedor: Optional[str] = Field(default=None)  # << NOVO
 class Invoice(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     cpf: str
@@ -94,10 +101,19 @@ def create_user(cpf: str, nome: str, password: str):
         s.add(User(cpf=cpf, nome=nome, password_hash=hash_pw(password)))
         s.commit()
 
+# --- util para adicionar coluna se faltar (SQLite) ---
+def ensure_column(engine, table: str, column: str, sqltype: str):
+    # funciona em SQLite; adapta para outros bancos se precisar
+    with engine.connect() as con:
+        cols = [row[1] for row in con.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            con.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {sqltype}")
+
 @app.on_event("startup")
 def _init_db():
     SQLModel.metadata.create_all(engine)
     # Seed opcional p/ desenvolvimento:
+    ensure_column(engine, "user", "vendedor", "TEXT")
     create_user("12345678901", "Paciente Exemplo", "1234")
 
 def list_payment_ignores(patient_id: int) -> list[PaymentIgnore]:
@@ -573,23 +589,6 @@ class FeegowClient:
             })
         return appts
 
-    def _hydrate_appointments(self, appts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
-        for a in appts:
-            # ... (outros campos)
-
-            try:
-                pid = a.get("procedimento_id")
-                pid = int(pid) if pid is not None and str(pid).strip() != "" else None
-            except Exception:
-                pid = None
-
-            proc_name = self.get_procedure_name(pid) if pid else None
-            a["procedimento_nome"] = proc_name or a.get("tipo") or a.get("procedimento") or "Procedimento"
-
-            out.append(a)
-        return out
-
     # ----------------- Agenda (período arbitrário costurado) -----------------
     def _feegow_search(self, patient_id: int, start: date, end: date) -> List[Dict[str, Any]]:
         """Chama /appoints/search para [start, end] (<= 180 dias) e normaliza a saída."""
@@ -927,14 +926,6 @@ class FeegowClient:
                     "error": str(e)}
 
 feegow = FeegowClient()
-
-# ------------------------------------------------------------------
-# Schemas de entrada
-# ------------------------------------------------------------------
-class LoginDTO(BaseModel):
-    cpf: str
-    password: str
-
 # ------------------------------------------------------------------
 # Rotas principais
 # ------------------------------------------------------------------
@@ -955,7 +946,9 @@ def login(body: LoginDTO):
     return {
         "patient_id": pid,
         "name": nome_feegow or user.nome,
-        "cpf": body.cpf
+        "cpf": body.cpf,
+        "vendedor": user.vendedor or "",            # <— NOVO
+        "wa_number": SELLER_WA.get(user.vendedor)   # <— OPCIONAL
     }
 
 @app.get("/patient/{patient_id}/summary")
