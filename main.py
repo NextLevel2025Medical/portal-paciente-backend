@@ -996,10 +996,13 @@ def summary(
     patient_id: int, 
     debug: int = Query(0),
     invoice_id: Optional[str] = Query(None, description="Invoice ID para buscar pagamentos"),
-    cpf: Optional[str] = Query(None, description="CPF do usuário para buscar todos os invoice_id no app.db"),
     pay_start: str = Query("01-01-2000"),
     pay_end:   str = Query("31-08-2050"),
+    cpf_session: str = Depends(current_user),       # <— NOVO
 ):
+    my_pid, _ = feegow.get_patient_by_cpf(cpf_session)
+    if my_pid != patient_id:
+        raise HTTPException(status_code=403, detail="Acesso negado")
     """
     Monta o resumo. Propostas vêm do Feegow (proposal/list).
     Pagamentos/agendamentos permanecem stub em parte.
@@ -1025,8 +1028,7 @@ def summary(
     # >>> PAGAMENTOS: buscar todos os invoices do CPF (mais o invoice_id da URL, se vier) <<<
     invoice_ids: list[str] = []
     try:
-        if cpf:
-            invoice_ids.extend(list_invoice_ids_by_cpf(cpf))
+        invoice_ids.extend(list_invoice_ids_by_cpf(cpf_session))
         if invoice_id:
             iid = str(invoice_id)
             if iid not in invoice_ids:
@@ -1146,8 +1148,12 @@ def my_summary(
         raise HTTPException(status_code=404, detail="Paciente não encontrado")
 
     # Reutiliza a função 'summary' existente, garantindo autorização via sessão
-    data = summary(patient_id=pid, debug=debug, invoice_id=invoice_id, pay_start=pay_start, pay_end=pay_end)
-    # Ajuste de PII de forma controlada
+    data = summary(
+        patient_id=pid,
+        debug=debug, invoice_id=invoice_id,
+        pay_start=pay_start, pay_end=pay_end
+        cpf_session=cpf,   # <— passe o CPF da sessão aqui
+    )    # Ajuste de PII de forma controlada
     try:
         if isinstance(data, dict) and "paciente" in data and isinstance(data["paciente"], dict):
             data["paciente"]["cpf"] = cpf
