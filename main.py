@@ -1,4 +1,3 @@
-# backend/main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,9 +18,6 @@ SELLER_WA = {
     "Carolina": "553195426283",
 }
 
-# ------------------------------------------------------------------
-# Carrega variáveis do .env (FEEGOW_BASE, FEEGOW_TOKEN, etc.)
-# ------------------------------------------------------------------
 load_dotenv()
 
 app = FastAPI(title="Portal do Paciente - API")
@@ -31,16 +27,17 @@ origins = [
     "https://app.seudominio.com.br",                # seu subdomínio (quando apontar)
 ]
 
-# CORS liberado no dev; em produção restrinja ao seu domínio
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://portal-paciente-web.onrender.com",
+        "http://localhost:3000",  
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ====== Users (SQLite + bcrypt) ======
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_pw(p: str) -> str:
@@ -52,7 +49,6 @@ def verify_pw(p: str, h: str) -> bool:
 class User(SQLModel, table=True):
     cpf: str = Field(primary_key=True, index=True)
     nome: str
-    # importante: mapear para a COLUNA "password" do banco
     password_hash: str = Field(sa_column=Column("password", String, nullable=False))
     vendedor: Optional[str] = Field(default=None)  # << NOVO
 class Invoice(SQLModel, table=True):
@@ -61,12 +57,12 @@ class Invoice(SQLModel, table=True):
     invoice_id: str
 class PaymentIgnore(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    patient_id: int                      # 7314
-    date: Optional[str] = None           # '2025-08-05' (YYYY-MM-DD) – opcional
-    valor: Optional[float] = None        # 90300.00 – opcional
-    forma: Optional[str] = None          # '8' – opcional
-    occurrences: int = 1                 # quantas ocorrências devemos ignorar
-    note: Optional[str] = None           # observação
+    patient_id: int                      
+    date: Optional[str] = None           
+    valor: Optional[float] = None        
+    forma: Optional[str] = None          
+    occurrences: int = 1                 
+    note: Optional[str] = None           
 
 def list_invoice_ids_by_cpf(cpf: str) -> list[str]:
     """
@@ -101,9 +97,7 @@ def create_user(cpf: str, nome: str, password: str):
         s.add(User(cpf=cpf, nome=nome, password_hash=hash_pw(password)))
         s.commit()
 
-# --- util para adicionar coluna se faltar (SQLite) ---
 def ensure_column(engine, table: str, column: str, sqltype: str):
-    # funciona em SQLite; adapta para outros bancos se precisar
     with engine.connect() as con:
         cols = [row[1] for row in con.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
         if column not in cols:
@@ -112,7 +106,6 @@ def ensure_column(engine, table: str, column: str, sqltype: str):
 @app.on_event("startup")
 def _init_db():
     SQLModel.metadata.create_all(engine)
-    # Seed opcional p/ desenvolvimento:
     ensure_column(engine, "user", "vendedor", "TEXT")
     create_user("12345678901", "Paciente Exemplo", "1234")
 
@@ -121,7 +114,6 @@ def list_payment_ignores(patient_id: int) -> list[PaymentIgnore]:
         return s.exec(select(PaymentIgnore).where(PaymentIgnore.patient_id == patient_id)).all()
 
 def payment_matches_ignore(p: dict, ign: PaymentIgnore) -> bool:
-    # p = {"data":"YYYY-MM-DD", "valor":float, "forma": "id ou texto", ...}
     if ign.date and str(p.get("data")) != ign.date:
         return False
     if ign.valor is not None and float(p.get("valor") or 0.0) != float(ign.valor):
@@ -132,7 +124,6 @@ def payment_matches_ignore(p: dict, ign: PaymentIgnore) -> bool:
 
 def apply_payment_ignores(pagamentos: list[dict], patient_id: int) -> tuple[list[dict], list[dict]]:
     ignores = list_payment_ignores(patient_id)
-    # contador por ignore.id para consumir só 'occurrences' vezes
     consumed: dict[int,int] = {ign.id: 0 for ign in ignores if ign.id is not None}
     applied: list[dict] = []
 
@@ -151,18 +142,15 @@ def apply_payment_ignores(pagamentos: list[dict], patient_id: int) -> tuple[list
             out.append(p)
     return out, applied
 
-# ------------------------------------------------------------------
-# Cliente Feegow
-# ------------------------------------------------------------------
 class FeegowClient:
     def __init__(self) -> None:
         self.base = os.getenv("FEEGOW_BASE", "https://api.feegow.com/v1/api").rstrip("/")
         self.token = os.getenv("FEEGOW_TOKEN", "")
         self.auth_header = os.getenv("FEEGOW_AUTH_HEADER", "x-access-token")
-        self.auth_scheme = os.getenv("FEEGOW_AUTH_SCHEME", "")  # "Bearer" ou vazio
+        self.auth_scheme = os.getenv("FEEGOW_AUTH_SCHEME", "")  
         self.client = httpx.Client(timeout=20.0, trust_env=True)
         self._status_by_id: dict[int, str] = {}
-        self._status_last_fetch: float = 0.0  # epoch seconds
+        self._status_last_fetch: float = 0.0
 
     # ----------------- util -----------------
     def _headers(self) -> Dict[str, str]:
