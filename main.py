@@ -1151,7 +1151,7 @@ def my_summary(
     data = summary(
         patient_id=pid,
         debug=debug, invoice_id=invoice_id,
-        pay_start=pay_start, pay_end=pay_end
+        pay_start=pay_start, pay_end=pay_end,
         cpf_session=cpf,   # <— passe o CPF da sessão aqui
     )    # Ajuste de PII de forma controlada
     try:
