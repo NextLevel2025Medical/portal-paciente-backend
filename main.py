@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List, Optional
@@ -11,6 +12,7 @@ from sqlmodel import SQLModel, Field, Session, select, create_engine
 from sqlalchemy import String, Column, text
 from passlib.context import CryptContext
 import re
+import hmac, hashlib, base64, time, os
 
 SELLER_WA = {
     "Johnny":   "5531985252115",
@@ -914,6 +916,37 @@ class FeegowClient:
                     "error": str(e)}
 
 feegow = FeegowClient()
+
+# ====== Sessão (cookie HttpOnly) ======
+SECRET = os.getenv("SESSION_SECRET", "troque-isto")
+
+def make_token(cpf: str, ttl_seconds=60*60*8) -> str:
+    exp = int(time.time()) + ttl_seconds
+    msg = f"{cpf}.{exp}".encode()
+    sig = hmac.new(SECRET.encode(), msg, hashlib.sha256).digest()
+    return f"{cpf}.{exp}.{base64.urlsafe_b64encode(sig).decode()}"
+
+def parse_token(tok: str) -> str | None:
+    try:
+        cpf, exp, sig_b64 = tok.split(".")
+        exp = int(exp)
+        if exp < int(time.time()):
+            return None
+        msg = f"{cpf}.{exp}".encode()
+        sig_ok = hmac.new(SECRET.encode(), msg, hashlib.sha256).digest()
+        if hmac.compare_digest(sig_ok, base64.urlsafe_b64decode(sig_b64)):
+            return cpf
+    except Exception:
+        pass
+    return None
+
+def current_user(request: Request) -> str:
+    tok = request.cookies.get("pp_session")
+    cpf = parse_token(tok or "")
+    if not cpf:
+        raise HTTPException(status_code=401, detail="Não autenticado")
+    return cpf
+
 # ------------------------------------------------------------------
 # Rotas principais
 # ------------------------------------------------------------------
@@ -931,12 +964,31 @@ def login(body: LoginDTO):
     if not pid:
         raise HTTPException(status_code=404, detail="CPF não encontrado")
 
+    resp = JSONResponse({"ok": True})  # não devolva PII
+    tok = make_token(body.cpf)
+    # Se front e API estiverem em domínios diferentes, mantenha SameSite="none"
+    resp.set_cookie(
+        "pp_session", tok, httponly=True, secure=True,
+        samesite="none", max_age=60*60*8, path="/"
+    )
+    return resp
+
+@app.post("/auth/logout")
+def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("pp_session", path="/")
+    return resp
+
+@app.get("/auth/me")
+def auth_me(cpf: str = Depends(current_user)):
+    u = get_user(cpf)
+    pid, nome = feegow.get_patient_by_cpf(cpf)
     return {
-        "patient_id": pid,
-        "name": nome_feegow or user.nome,
-        "cpf": body.cpf,
-        "vendedor": user.vendedor or "",            # <— NOVO
-        "wa_number": SELLER_WA.get(user.vendedor)   # <— OPCIONAL
+        "cpf": cpf,
+        "name": nome or (u.nome if u else ""),
+        "patient_id": pid or 0,
+        "vendedor": (u.vendedor if u else None),
+        "wa_number": SELLER_WA.get(u.vendedor if u else None),
     }
 
 @app.get("/patient/{patient_id}/summary")
@@ -1079,6 +1131,30 @@ def summary(
     if debug:
         data.setdefault("_debug", {})["qtd_agendamentos"] = len(data.get("agendamentos", []))
 
+    return data
+
+@app.get("/me/summary")
+def my_summary(
+    cpf: str = Depends(current_user),
+    debug: int = Query(0),
+    invoice_id: Optional[str] = Query(None),
+    pay_start: str = Query("01-01-2000"),
+    pay_end:   str = Query("31-08-2050"),
+):
+    pid, nome = feegow.get_patient_by_cpf(cpf)
+    if not pid:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado")
+
+    # Reutiliza a função 'summary' existente, garantindo autorização via sessão
+    data = summary(patient_id=pid, debug=debug, invoice_id=invoice_id, pay_start=pay_start, pay_end=pay_end)
+    # Ajuste de PII de forma controlada
+    try:
+        if isinstance(data, dict) and "paciente" in data and isinstance(data["paciente"], dict):
+            data["paciente"]["cpf"] = cpf
+            if nome:
+                data["paciente"]["nome"] = nome
+    except Exception:
+        pass
     return data
 
 # ------------------------------------------------------------------
