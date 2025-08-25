@@ -969,7 +969,7 @@ def login(body: LoginDTO):
     # Se front e API estiverem em domínios diferentes, mantenha SameSite="none"
     resp.set_cookie(
         "pp_session", tok, httponly=True, secure=True,
-        samesite="none", max_age=60*60*8, path="/"
+        samesite="lax", max_age=60*60*8, path="/"
     )
     return resp
 
