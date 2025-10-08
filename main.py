@@ -870,10 +870,10 @@ class FeegowClient:
         # já é número?
         if isinstance(valor, (int, float)):
             # heurística: inteiro grande e múltiplo de 100 => centavos
-            if isinstance(valor, int) and valor >= 100_000 and valor % 100 == 0:
+            if isinstance(valor, int) and valor >= 10_000:
                 return valor / 100.0
             # float muito grande (veio como 942000.0) também
-            if isinstance(valor, float) and valor >= 100_000:
+            if isinstance(valor, float) and valor >= 10_000:
                 return valor / 100.0
             return float(valor)
 
@@ -884,7 +884,7 @@ class FeegowClient:
         # só dígitos? pode ser centavos (ex.: 942000)
         if s.isdigit():
             n = int(s)
-            if n >= 100_000 and n % 100 == 0:
+            if n >= 10_000:
                 return n / 100.0
             return float(n)
 
