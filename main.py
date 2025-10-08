@@ -42,14 +42,17 @@ app.add_middleware(
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def hash_pw(p: str) -> str:
-    return pwd_ctx.hash(p)
+def _truncate_72_bytes(s: str) -> str:
+    if not s:
+        return s
+    b = s.encode("utf-8")[:72]          # garante <= 72 bytes
+    return b.decode("utf-8", "ignore")  # remove byte parcial no fim, se houver
 
-def verify_pw(p, h):
-    # bcrypt aceita até 72 bytes, corta o excesso se ultrapassar
-    if p and len(p.encode("utf-8")) > 72:
-        p = p[:72]
-    return pwd_ctx.verify(p, h)
+def hash_pw(p: str) -> str:
+    return pwd_ctx.hash(_truncate_72_bytes(p))
+
+def verify_pw(p: str, h: str) -> bool:
+    return pwd_ctx.verify(_truncate_72_bytes(p), h)
 
 class User(SQLModel, table=True):
     cpf: str = Field(primary_key=True, index=True)
