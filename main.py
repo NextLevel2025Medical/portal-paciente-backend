@@ -45,7 +45,10 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 def hash_pw(p: str) -> str:
     return pwd_ctx.hash(p)
 
-def verify_pw(p: str, h: str) -> bool:
+def verify_pw(p, h):
+    # bcrypt aceita até 72 bytes, corta o excesso se ultrapassar
+    if p and len(p.encode("utf-8")) > 72:
+        p = p[:72]
     return pwd_ctx.verify(p, h)
 
 class User(SQLModel, table=True):
