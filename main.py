@@ -59,6 +59,7 @@ class User(SQLModel, table=True):
     nome: str
     password_hash: str = Field(sa_column=Column("password", String, nullable=False))
     vendedor: Optional[str] = Field(default=None)  # << NOVO
+    is_admin: bool = Field(default=False)  # << NOVO
 class Invoice(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     cpf: str
@@ -104,6 +105,25 @@ def create_user(cpf: str, nome: str, password: str):
             return
         s.add(User(cpf=cpf, nome=nome, password_hash=hash_pw(password)))
         s.commit()
+        
+def create_admin_from_env():
+    cpf = re.sub(r"\D+", "", (os.getenv("ADMIN_CPF", "") or "").strip())
+    pwd = (os.getenv("ADMIN_PASSWORD", "") or "").strip()
+    nome = (os.getenv("ADMIN_NAME", "Administrador") or "Administrador").strip()
+
+    if not cpf or not pwd:
+        return
+
+    with Session(engine) as s:
+        u = s.get(User, cpf)
+        if not u:
+            u = User(cpf=cpf, nome=nome, password_hash=hash_pw(pwd), vendedor=None, is_admin=True)
+            s.add(u)
+        else:
+            u.nome = nome or u.nome
+            u.password_hash = hash_pw(pwd)
+            u.is_admin = True
+        s.commit()
 
 def ensure_column(engine, table: str, column: str, sqltype: str):
     with engine.connect() as con:
@@ -115,7 +135,8 @@ def ensure_column(engine, table: str, column: str, sqltype: str):
 def _init_db():
     SQLModel.metadata.create_all(engine)
     ensure_column(engine, "user", "vendedor", "TEXT")
-    create_user("12345678901", "Paciente Exemplo", "1234")
+    ensure_column(engine, "user", "is_admin", "INTEGER DEFAULT 0")
+    create_admin_from_env()
 
 def list_payment_ignores(patient_id: int) -> list[PaymentIgnore]:
     with Session(engine) as s:
@@ -870,10 +891,10 @@ class FeegowClient:
         # já é número?
         if isinstance(valor, (int, float)):
             # heurística: inteiro grande e múltiplo de 100 => centavos
-            if isinstance(valor, int) and valor >= 10_000:
+            if isinstance(valor, int) and valor >= 100_000 and valor % 100 == 0:
                 return valor / 100.0
             # float muito grande (veio como 942000.0) também
-            if isinstance(valor, float) and valor >= 10_000:
+            if isinstance(valor, float) and valor >= 100_000:
                 return valor / 100.0
             return float(valor)
 
@@ -884,7 +905,7 @@ class FeegowClient:
         # só dígitos? pode ser centavos (ex.: 942000)
         if s.isdigit():
             n = int(s)
-            if n >= 10_000:
+            if n >= 100_000 and n % 100 == 0:
                 return n / 100.0
             return float(n)
 
@@ -966,13 +987,14 @@ def login(body: LoginDTO):
     if not user or not verify_pw(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
 
-    pid, nome_feegow = feegow.get_patient_by_cpf(body.cpf)
-    if not pid:
-        raise HTTPException(status_code=404, detail="CPF não encontrado")
+    # usuário comum precisa existir no Feegow; admin não
+    if not getattr(user, "is_admin", False):
+        pid, _ = feegow.get_patient_by_cpf(body.cpf)
+        if not pid:
+            raise HTTPException(status_code=404, detail="CPF não encontrado")
 
-    resp = JSONResponse({"ok": True})  # não devolva PII
+    resp = JSONResponse({"ok": True, "is_admin": bool(getattr(user, "is_admin", False))})
     tok = make_token(body.cpf)
-    # Se front e API estiverem em domínios diferentes, mantenha SameSite="none"
     resp.set_cookie(
         "pp_session", tok, httponly=True, secure=True,
         samesite="lax", max_age=60*60*8, path="/"
@@ -988,14 +1010,84 @@ def logout():
 @app.get("/auth/me")
 def auth_me(cpf: str = Depends(current_user)):
     u = get_user(cpf)
-    pid, nome = feegow.get_patient_by_cpf(cpf)
+
+    if u and getattr(u, "is_admin", False):
+        pid, nome = 0, (u.nome or "")
+    else:
+        pid, nome = feegow.get_patient_by_cpf(cpf)
+
     return {
         "cpf": cpf,
         "name": nome or (u.nome if u else ""),
         "patient_id": pid or 0,
         "vendedor": (u.vendedor if u else None),
         "wa_number": SELLER_WA.get(u.vendedor if u else None),
+        "is_admin": bool(getattr(u, "is_admin", False)) if u else False,
     }
+
+def require_admin(cpf: str = Depends(current_user)) -> User:
+    u = get_user(cpf)
+    if not u or not getattr(u, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Acesso restrito ao admin")
+    return u
+
+class AdminCreateUserDTO(BaseModel):
+    nome: str
+    cpf: str
+    invoice_id: str
+    vendedor: Optional[str] = None
+
+@app.post("/admin/users")
+def admin_create_user(body: AdminCreateUserDTO, admin: User = Depends(require_admin)):
+    cpf = re.sub(r"\D+", "", body.cpf or "")
+    if len(cpf) != 11:
+        raise HTTPException(status_code=422, detail="CPF inválido (11 dígitos)")
+
+    nome = (body.nome or "").strip()
+    invoice_id = (body.invoice_id or "").strip()
+    vendedor = (body.vendedor or None)
+    if vendedor is not None:
+        vendedor = vendedor.strip() or None
+
+    if not nome:
+        raise HTTPException(status_code=422, detail="Nome é obrigatório")
+    if not invoice_id:
+        raise HTTPException(status_code=422, detail="Invoice é obrigatória")
+
+    with Session(engine) as s:
+        u = s.get(User, cpf)
+        if not u:
+            u = User(cpf=cpf, nome=nome, password_hash=hash_pw(cpf), vendedor=vendedor, is_admin=False)
+            s.add(u)
+            s.commit()
+        else:
+            u.nome = nome
+            u.vendedor = vendedor
+            s.add(u)
+            s.commit()
+
+        existing = s.exec(select(Invoice).where(Invoice.cpf == cpf, Invoice.invoice_id == invoice_id)).first()
+        if not existing:
+            s.add(Invoice(cpf=cpf, invoice_id=invoice_id))
+            s.commit()
+
+    return {"ok": True, "cpf": cpf, "invoice_id": invoice_id}
+
+@app.get("/admin/users")
+def admin_list_users(limit: int = Query(50, ge=1, le=200), admin: User = Depends(require_admin)):
+    with Session(engine) as s:
+        users = s.exec(select(User).order_by(User.cpf.desc()).limit(limit)).all()
+        data = []
+        for u in users:
+            invs = s.exec(select(Invoice.invoice_id).where(Invoice.cpf == u.cpf)).all()
+            data.append({
+                "cpf": u.cpf,
+                "nome": u.nome,
+                "vendedor": u.vendedor,
+                "is_admin": bool(getattr(u, "is_admin", False)),
+                "invoices": invs,
+            })
+        return {"ok": True, "users": data}
 
 @app.get("/patient/{patient_id}/summary")
 def summary(
