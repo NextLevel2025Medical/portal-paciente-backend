@@ -75,23 +75,35 @@ class PaymentIgnore(SQLModel, table=True):
 
 def list_invoice_ids_by_cpf(cpf: str) -> list[str]:
     """
-    Retorna todos os invoice_id vinculados ao CPF na tabela invoice (sem duplicar e preservando ordem).
+    Retorna todos os invoice_id vinculados ao CPF na tabela invoice.
+    Aceita compatibilidade quando o invoice_id foi salvo como "12877,12878, 12879"
+    (quebra por vírgula/; / espaços), remove não-dígitos e não duplica.
     """
     import re
     cpf_num = re.sub(r"\D+", "", cpf or "")
     if not cpf_num:
         return []
+
     with Session(engine) as s:
         rows = s.exec(select(Invoice.invoice_id).where(Invoice.cpf == cpf_num)).all()
-        uniq: list[str] = []
-        for r in rows:
-            # Suporta formatos (valor direto, tupla, objeto)
-            v = (r[0] if isinstance(r, (tuple, list)) else
-                 (getattr(r, "invoice_id", None) if hasattr(r, "invoice_id") else r))
-            v = str(v) if v is not None else ""
-            if v and v not in uniq:
-                uniq.append(v)
-        return uniq
+
+    uniq: list[str] = []
+    seen = set()
+
+    for r in rows:
+        v = (r[0] if isinstance(r, (tuple, list)) else
+             (getattr(r, "invoice_id", None) if hasattr(r, "invoice_id") else r))
+        v = str(v) if v is not None else ""
+
+        # quebra quando veio "12877,12878, 12879"
+        parts = [p.strip() for p in re.split(r"[,\s;]+", v) if p.strip()]
+        for p in parts:
+            p = re.sub(r"\D+", "", p)  # mantém só números
+            if p and p not in seen:
+                uniq.append(p)
+                seen.add(p)
+
+    return uniq
 
 engine = create_engine("sqlite:///./app.db", connect_args={"check_same_thread": False})
 
