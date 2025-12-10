@@ -898,35 +898,45 @@ class FeegowClient:
         return out
 
     def _money_to_float(self, valor) -> float:
+        """
+        Normaliza valores monetários vindos do Feegow.
+        - Quando vier inteiro/strings só com dígitos, geralmente está em CENTAVOS (ex.: 155675 = 1556.75).
+        - Quando vier float com casas decimais, assume que já está em reais.
+        """
         if valor is None:
             return 0.0
-        # já é número?
+
+        # número
         if isinstance(valor, (int, float)):
-            # heurística: inteiro grande e múltiplo de 100 => centavos
-            if isinstance(valor, int) and valor >= 100_000 and valor % 100 == 0:
-                return valor / 100.0
-            # float muito grande (veio como 942000.0) também
-            if isinstance(valor, float) and valor >= 100_000:
-                return valor / 100.0
-            return float(valor)
+            # float com casas -> já está em reais
+            if isinstance(valor, float) and not valor.is_integer():
+                return float(valor)
 
-        s = str(valor).strip()
-        if s == "":
-            return 0.0
-
-        # só dígitos? pode ser centavos (ex.: 942000)
-        if s.isdigit():
-            n = int(s)
-            if n >= 100_000 and n % 100 == 0:
+            n = int(valor)  # int puro ou float .0
+            # Heurística melhor: >= 100 (3+ dígitos) normalmente indica centavos
+            # (ex.: 155675 -> 1556.75, 5000 -> 50.00, 150 -> 1.50)
+            if abs(n) >= 100:
                 return n / 100.0
             return float(n)
 
-        # formatos com milhar/decimal brasileiros
+        s = str(valor).strip()
+        if not s:
+            return 0.0
+
+        # string só com dígitos -> provavelmente centavos
+        if s.isdigit():
+            n = int(s)
+            if len(s) >= 3:  # 100+ => centavos
+                return n / 100.0
+            return float(n)
+
+        # string com separadores BR/US
         s = s.replace(".", "").replace(",", ".")
         try:
             return float(s)
         except Exception:
             return 0.0
+
     def debug_list_invoice(self, invoice_id: str,
                             data_start: str = "01-01-2000",
                             data_end: str   = "31-08-2050",
