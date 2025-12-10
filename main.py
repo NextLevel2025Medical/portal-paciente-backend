@@ -105,9 +105,13 @@ def list_invoice_ids_by_cpf(cpf: str) -> list[str]:
 
     return uniq
 
-engine = create_engine("sqlite:///./app.db", connect_args={"check_same_thread": False})
+DB_PATH = os.getenv("DB_PATH", "/var/data/portal.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+DB_URL = f"sqlite:///{DB_PATH}"
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 
 def get_user(cpf: str) -> User | None:
+    cpf = re.sub(r"\D+", "", cpf or "")
     with Session(engine) as s:
         return s.get(User, cpf)
 
@@ -1005,23 +1009,22 @@ class LoginDTO(BaseModel):
 
 @app.post("/auth/login")
 def login(body: LoginDTO):
-    user = get_user(body.cpf)
+    cpf = re.sub(r"\D+", "", body.cpf or "")
+    user = get_user(cpf)
     if not user or not verify_pw(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
 
-    # usuário comum precisa existir no Feegow; admin não
     if not getattr(user, "is_admin", False):
-        pid, _ = feegow.get_patient_by_cpf(body.cpf)
+        pid, _ = feegow.get_patient_by_cpf(cpf)
         if not pid:
             raise HTTPException(status_code=404, detail="CPF não encontrado")
 
     resp = JSONResponse({"ok": True, "is_admin": bool(getattr(user, "is_admin", False))})
-    tok = make_token(body.cpf)
-    resp.set_cookie(
-        "pp_session", tok, httponly=True, secure=True,
-        samesite="lax", max_age=60*60*8, path="/"
-    )
+    tok = make_token(cpf)
+    resp.set_cookie("pp_session", tok, httponly=True, secure=True, samesite="lax",
+                    max_age=60*60*8, path="/")
     return resp
+
 
 @app.post("/auth/logout")
 def logout():
