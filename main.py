@@ -187,6 +187,42 @@ def apply_payment_ignores(pagamentos: list[dict], patient_id: int) -> tuple[list
             out.append(p)
     return out, applied
 
+def dedupe_payments(pagamentos: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Remove duplicações quando o MESMO pagamento aparece em mais de uma invoice.
+    Preferência:
+      - se houver 'uid', deduplica por uid
+      - senão, deduplica por (data, valor arredondado 2 casas, forma)
+    Retorna: (lista_deduplicada, lista_removidos_para_debug)
+    """
+    seen = set()
+    out: list[dict] = []
+    removed: list[dict] = []
+
+    for p in pagamentos or []:
+        if not isinstance(p, dict):
+            continue
+
+        uid = (p.get("uid") or "").strip() if isinstance(p.get("uid"), str) else p.get("uid")
+        data = str(p.get("data") or "").strip()
+        forma = str(p.get("forma") or "").strip()
+
+        try:
+            valor = round(float(p.get("valor") or 0.0), 2)
+        except Exception:
+            valor = 0.0
+
+        key = f"uid:{uid}" if uid else f"{data}|{valor:.2f}|{forma}".upper()
+
+        if key in seen:
+            removed.append(p)
+            continue
+
+        seen.add(key)
+        out.append(p)
+
+    return out, removed
+
 class FeegowClient:
     def __init__(self) -> None:
         self.base = os.getenv("FEEGOW_BASE", "https://api.feegow.com/v1/api").rstrip("/")
@@ -896,7 +932,24 @@ class FeegowClient:
             )
 
             if dt_norm and valor:
-                out.append({"data": dt_norm, "valor": valor, "forma": str(forma)})
+                # tenta pegar um identificador único quando existir
+                uid = (
+                    it.get("id")
+                    or it.get("payment_id")
+                    or it.get("pagamento_id")
+                    or it.get("lancamento_id")
+                    or it.get("movimento_id")
+                    or it.get("titulo_id")
+                )
+
+                if dt_norm and valor:
+                    out.append({
+                        "data": dt_norm,
+                        "valor": float(valor),
+                        "forma": str(forma),
+                        "uid": str(uid) if uid is not None else None,   # << novo
+                        "invoice_id": str(invoice_id),                  # << novo (rastreabilidade)
+                    })
 
         out.sort(key=lambda x: x["data"])
         return out
@@ -1170,7 +1223,11 @@ def summary(
                         "qtd": len(pagos or []),
                     }
                 if isinstance(pagos, list) and pagos:
-                    data["pagamentos"] = pagos
+                    pagos_dedup, removidos = dedupe_payments(pagos)
+                    data["pagamentos"] = pagos_dedup
+                    if debug and removidos:
+                        data.setdefault("_debug", {})["pagamentos_duplicados_removidos_single_invoice"] = removidos
+
             except httpx.HTTPError as e:
                 if debug:
                     data.setdefault("_debug", {})["pagamentos_error"] = {
@@ -1205,7 +1262,13 @@ def summary(
             # ordena por data e aplica (se nada vier, mantém stub)
             if todos:
                 todos.sort(key=lambda x: x.get("data") or "")
-                data["pagamentos"] = todos
+
+                # >>> NOVO: dedupe para evitar o mesmo pagamento em duas invoices
+                todos_dedup, removidos = dedupe_payments(todos)
+                data["pagamentos"] = todos_dedup
+
+                if debug and removidos:
+                    data.setdefault("_debug", {})["pagamentos_duplicados_removidos"] = removidos
 
             # útil p/ conferir na UI durante dev
             if debug:
