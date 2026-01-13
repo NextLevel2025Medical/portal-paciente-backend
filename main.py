@@ -1,1402 +1,2595 @@
-from fastapi import FastAPI, HTTPException, Query, Request, Depends
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, List, Optional
+from __future__ import annotations
+
+from datetime import datetime, date, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any
+
+from fastapi import FastAPI, Depends, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from sqlmodel import Session, select, delete
+from sqlalchemy import or_, text, func
+from sqlalchemy.exc import IntegrityError
+
+from db import create_db_and_tables, get_session, engine
+from models import User, Room, Reservation, ReservationRequest, AuditLog, SurgicalMapEntry, AgendaBlock, AgendaBlockSurgeon, GustavoAgendaSnapshot, LodgingReservation
+from auth import hash_password, verify_password, require
+
+from pathlib import Path
+
+import calendar
 import os
-import httpx
-from dotenv import load_dotenv
-from datetime import date, timedelta, datetime
-from calendar import monthrange
-from sqlmodel import SQLModel, Field, Session, select, create_engine
-from sqlalchemy import String, Column, text
-from passlib.context import CryptContext
-import re
-import hmac, hashlib, base64, time, os
+import json
+import logging
+from logging.handlers import RotatingFileHandler
 
-SELLER_WA = {
-    "Johnny":   "5531985252115",
-    "Ana Maria":"553172631346",
-    "Carolina": "553195426283",
-}
+import threading
+import time as pytime
 
-load_dotenv()
+TZ = timezone(timedelta(hours=-3))  # Brasil (-03:00)
+SLOT_MINUTES = 30
+START_HOUR = 7
+END_HOUR = 19  # 19:00 (último slot começa 18:30)
 
-app = FastAPI(title="Portal do Paciente - API")
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="CHANGE_ME_SUPER_SECRET_KEY")
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-origins = [
-    "https://github.com/NextLevel2025Medical/portal-paciente-web",  # sua URL do web no Render
-    "https://app.seudominio.com.br",                # seu subdomínio (quando apontar)
-]
+AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "audit.log")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://portal-paciente-web.onrender.com",
-        "http://localhost:3000",  
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+audit_logger = logging.getLogger("audit")
+audit_logger.setLevel(logging.INFO)
+audit_logger.propagate = False
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+if not audit_logger.handlers:
+    fh = RotatingFileHandler(
+        AUDIT_LOG_PATH,
+        maxBytes=2_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    audit_logger.addHandler(fh)
 
-def _truncate_72_bytes(s: str) -> str:
-    if not s:
-        return s
-    b = s.encode("utf-8")[:72]          # garante <= 72 bytes
-    return b.decode("utf-8", "ignore")  # remove byte parcial no fim, se houver
+def to_db_dt(dt: datetime) -> datetime:
+    """Converte qualquer datetime para horário local (-03) e remove tz/segundos p/ persistir no SQLite."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ).replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
 
-def hash_pw(p: str) -> str:
-    return pwd_ctx.hash(_truncate_72_bytes(p))
+def fmt_brasilia(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    # Se veio "naive" do SQLite, vamos assumir que era UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M")
 
-def verify_pw(p: str, h: str) -> bool:
-    return pwd_ctx.verify(_truncate_72_bytes(p), h)
+def slot_keys(dt: datetime) -> tuple[str, str]:
+    """Retorna 2 chaves: sem segundos e com segundos, para evitar mismatch com o front."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    dt = dt.replace(second=0, microsecond=0)
+    return (
+        dt.isoformat(timespec="minutes"),  # 2025-11-29T07:00-03:00
+        dt.isoformat(timespec="seconds"),  # 2025-11-29T07:00:00-03:00
+    )
 
-class User(SQLModel, table=True):
-    cpf: str = Field(primary_key=True, index=True)
-    nome: str
-    password_hash: str = Field(sa_column=Column("password", String, nullable=False))
-    vendedor: Optional[str] = Field(default=None)  # << NOVO
-    is_admin: bool = Field(default=False)  # << NOVO
-class Invoice(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    cpf: str
-    invoice_id: str
-class PaymentIgnore(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    patient_id: int                      
-    date: Optional[str] = None           
-    valor: Optional[float] = None        
-    forma: Optional[str] = None          
-    occurrences: int = 1                 
-    note: Optional[str] = None           
+def local_today_str() -> str:
+    return datetime.now(TZ).date().isoformat()
 
-def list_invoice_ids_by_cpf(cpf: str) -> list[str]:
+
+def safe_selected_and_day(raw_date: Optional[str]) -> tuple[str, date]:
     """
-    Retorna todos os invoice_id vinculados ao CPF na tabela invoice.
-    Aceita compatibilidade quando o invoice_id foi salvo como "12877,12878, 12879"
-    (quebra por vírgula/; / espaços), remove não-dígitos e não duplica.
+    Aceita None, "" ou uma string iso (YYYY-MM-DD).
+    Retorna (selected_str, day_date) sempre válido, sem estourar ValueError.
     """
-    import re
-    cpf_num = re.sub(r"\D+", "", cpf or "")
-    if not cpf_num:
-        return []
+    selected = (raw_date or "").strip() or local_today_str()
+    try:
+        day = datetime.fromisoformat(selected).date()
+    except ValueError:
+        selected = local_today_str()
+        day = datetime.fromisoformat(selected).date()
+    return selected, day
 
-    with Session(engine) as s:
-        rows = s.exec(select(Invoice.invoice_id).where(Invoice.cpf == cpf_num)).all()
+def safe_selected_month(raw: Optional[str]) -> tuple[str, date, date, list[date]]:
+    """
+    Aceita None, "" ou 'YYYY-MM'. Retorna:
+    selected ('YYYY-MM'), first_day, next_month_first_day, list_days
+    """
+    selected = (raw or "").strip() or datetime.now(TZ).strftime("%Y-%m")
+    try:
+        dt = datetime.strptime(selected, "%Y-%m")
+    except ValueError:
+        selected = datetime.now(TZ).strftime("%Y-%m")
+        dt = datetime.strptime(selected, "%Y-%m")
 
-    uniq: list[str] = []
-    seen = set()
+    first = date(dt.year, dt.month, 1)
+    # primeiro dia do mês seguinte
+    if dt.month == 12:
+        next_first = date(dt.year + 1, 1, 1)
+    else:
+        next_first = date(dt.year, dt.month + 1, 1)
 
-    for r in rows:
-        v = (r[0] if isinstance(r, (tuple, list)) else
-             (getattr(r, "invoice_id", None) if hasattr(r, "invoice_id") else r))
-        v = str(v) if v is not None else ""
+    last_day = calendar.monthrange(dt.year, dt.month)[1]
+    days = [date(dt.year, dt.month, d) for d in range(1, last_day + 1)]
+    return selected, first, next_first, days
 
-        # quebra quando veio "12877,12878, 12879"
-        parts = [p.strip() for p in re.split(r"[,\s;]+", v) if p.strip()]
-        for p in parts:
-            p = re.sub(r"\D+", "", p)  # mantém só números
-            if p and p not in seen:
-                uniq.append(p)
-                seen.add(p)
+def build_slots_for_day(day: date):
+    start_dt = datetime.combine(day, time(START_HOUR, 0), tzinfo=TZ)
+    end_dt = datetime.combine(day, time(END_HOUR, 0), tzinfo=TZ)
+    slots = []
+    cur = start_dt
+    while cur < end_dt:
+        slots.append(cur)
+        cur += timedelta(minutes=SLOT_MINUTES)
+    return slots
 
-    return uniq
 
-DB_PATH = os.getenv("DB_PATH", "/var/data/portal.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-DB_URL = f"sqlite:///{DB_PATH}"
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+def get_current_user(request: Request, session: Session) -> Optional[User]:
+    uid = request.session.get("user_id")
+    if not uid:
+        return None
+    return session.get(User, uid)
 
-def get_user(cpf: str) -> User | None:
-    cpf = re.sub(r"\D+", "", cpf or "")
-    with Session(engine) as s:
-        return s.get(User, cpf)
+def audit_event(
+    request: Request,
+    actor: Optional[User],
+    action: str,
+    *,
+    success: bool = True,
+    message: Optional[str] = None,
+    room_id: Optional[int] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    extra: Optional[dict] = None,
+):
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    method = request.method
+    path = request.url.path
 
-def create_user(cpf: str, nome: str, password: str):
-    with Session(engine) as s:
-        if s.get(User, cpf):
-            return
-        s.add(User(cpf=cpf, nome=nome, password_hash=hash_pw(password)))
-        s.commit()
-        
-def create_admin_from_env():
-    cpf = re.sub(r"\D+", "", (os.getenv("ADMIN_CPF", "") or "").strip())
-    pwd = (os.getenv("ADMIN_PASSWORD", "") or "").strip()
-    nome = (os.getenv("ADMIN_NAME", "Administrador") or "Administrador").strip()
+    # 1) grava no arquivo (nunca pode quebrar o sistema)
+    try:
+        payload = {
+            "actor": getattr(actor, "username", None),
+            "role": getattr(actor, "role", None),
+            "action": action,
+            "success": success,
+            "message": message,
+            "room_id": room_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "start_time": start_time.isoformat(timespec="minutes") if start_time else None,
+            "end_time": end_time.isoformat(timespec="minutes") if end_time else None,
+            "ip": ip,
+            "path": path,
+            "method": method,
+            "extra": extra or None,
+        }
+        audit_logger.info(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
 
-    if not cpf or not pwd:
-        return
+    # 2) grava no banco (isolado, pra não atrapalhar transações do request)
+    try:
+        with Session(engine) as s:
+            row = AuditLog(
+                actor_user_id=getattr(actor, "id", None),
+                actor_username=getattr(actor, "username", None),
+                actor_role=getattr(actor, "role", None),
+                action=action,
+                success=success,
+                message=message,
+                room_id=room_id,
+                target_type=target_type,
+                target_id=target_id,
+                start_time=start_time,
+                end_time=end_time,
+                ip=ip,
+                user_agent=ua,
+                path=path,
+                method=method,
+                extra_json=json.dumps(extra, ensure_ascii=False) if extra else None,
+            )
+            s.add(row)
+            s.commit()
+    except Exception as e:
+        audit_logger.exception("AUDIT_DB_FAIL | action=%s | err=%s", action, str(e))
 
-    with Session(engine) as s:
-        u = s.get(User, cpf)
-        if not u:
-            u = User(cpf=cpf, nome=nome, password_hash=hash_pw(pwd), vendedor=None, is_admin=True)
-            s.add(u)
+
+def redirect(path: str):
+    return RedirectResponse(path, status_code=303)
+
+
+def seed_if_empty(session: Session):
+    # =========================
+    # USERS (cria SE não existir)
+    # =========================
+    def ensure_user(username: str, full_name: str, role: str, password: str):
+        existing = session.exec(select(User).where(User.username == username)).first()
+        if not existing:
+            session.add(
+                User(
+                    username=username,
+                    full_name=full_name,
+                    role=role,
+                    password_hash=hash_password(password),
+                    is_active=True,
+                )
+            )
+
+    # Admin padrão
+    ensure_user("secretaria", "Secretaria (Admin)", "admin", "admin123")
+
+    # Médicos padrão
+    doctors = [
+        ("drgustavo", "Dr. Gustavo Aquino"),
+        ("drricardo", "Dr. Ricardo Vilela"),
+        ("draalice", "Dra. Alice Osório"),
+        ("dramelina", "Dra. Mellina Tanure"),
+        ("dravanessa", "Dra. Vanessa Santos"),
+        ("drathamilys", "Dra. Thamilys Benfica"),
+        ("drastela", "Dra. Stela Temponi"),
+        ("draglesiane", "Dra. Glesiane Teixeira"),
+    ]
+    for username, name in doctors:
+        ensure_user(username, name, "doctor", "senha123")
+
+    # NOVO: usuário do Mapa Cirúrgico
+    ensure_user("johnny.ge", "Johnny", "surgery", "@Ynnhoj91")
+    ensure_user("ana.maria", "Ana Maria", "surgery", "AnaM#2025@91")
+    ensure_user("cris.galdino", "Cristiane Galdino", "surgery", "CrisG@2025#47")
+    ensure_user("carolina.abdo", "Carolina", "surgery", "Caro!2025#38")
+    ensure_user("ariella.vieira", "Ariella", "surgery", "Ariella$2026")
+    ensure_user("camilla.martins", "Camilla", "comissao", "Camilla*2026")
+
+    session.commit()
+
+    # =========================
+    # ROOMS (cria SE não existir)
+    # =========================
+    rooms = session.exec(select(Room)).all()
+    if not rooms:
+        default_rooms = [
+            Room(name="Consultório 1", is_active=True),
+            Room(name="Consultório 2", is_active=True),
+            Room(name="Consultório 3", is_active=True),
+        ]
+        session.add_all(default_rooms)
+        session.commit()
+
+def validate_mapa_rules(
+    session: Session,
+    day: date,
+    surgeon_id: int,
+    procedure_type: str,
+    uses_hsr: bool = False,
+    exclude_entry_id: int | None = None,
+) -> str | None:
+    """
+    Regras do Mapa Cirúrgico
+
+    ✅ Reserva conta como agendamento (SurgicalMapEntry com is_pre_reservation=True também entra na contagem).
+
+    Regras:
+    - Dr. Gustavo Aquino:
+        * Cirurgia / Procedimento Simples: somente Segunda e Quarta (máx 2 por dia)
+        * Refinamento: Segunda e Quarta (máx 2 por dia) + Sexta (máx 1 por dia)
+    - Dra. Alice Osório e Dr. Ricardo Vilela:
+        * Operam Terça, Quinta e Sexta (máx 1 por dia)
+        * Não podem operar no mesmo dia (se um tem qualquer agendamento/reserva, o outro não pode)
+    - Slot HSR: proibido em Janeiro e Julho
+    """
+
+    gustavo = session.exec(select(User).where(User.full_name == "Dr. Gustavo Aquino")).first()
+    alice = session.exec(select(User).where(User.full_name == "Dra. Alice Osório")).first()
+    ricardo = session.exec(select(User).where(User.full_name == "Dr. Ricardo Vilela")).first()
+
+    def _apply_exclude(q):
+        if exclude_entry_id is not None:
+            return q.where(SurgicalMapEntry.id != exclude_entry_id)
+        return q
+
+    # HSR jan/jul
+    if uses_hsr and day.month in (1, 7):
+        return "Regra: não é permitido agendar Slot HSR em Janeiro e Julho."
+
+    wd = day.weekday()  # 0=Seg,1=Ter,2=Qua,3=Qui,4=Sex,5=Sáb,6=Dom
+
+    # =========================
+    # (A) Dr. Gustavo Aquino
+    # =========================
+    if gustavo and surgeon_id == gustavo.id:
+        if procedure_type == "Refinamento":
+            # Seg/Qua até 2, Sex até 1
+            if wd in (0, 2):
+                cap = 2
+            elif wd == 4:
+                cap = 1
+            else:
+                return "Regra: Dr. Gustavo Aquino opera Refinamento apenas na Segunda, Quarta ou Sexta."
         else:
-            u.nome = nome or u.nome
-            u.password_hash = hash_pw(pwd)
-            u.is_admin = True
-        s.commit()
+            # Cirurgia / Procedimento Simples: só Seg/Qua até 2
+            if wd not in (0, 2):
+                return "Regra: Dr. Gustavo Aquino opera Cirurgia/Procedimento Simples apenas na Segunda e Quarta."
+            cap = 2
 
-def ensure_column(engine, table: str, column: str, sqltype: str):
-    with engine.connect() as con:
-        cols = [row[1] for row in con.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
-        if column not in cols:
-            con.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {sqltype}")
+        q = select(SurgicalMapEntry.id).where(
+            SurgicalMapEntry.day == day,
+            SurgicalMapEntry.surgeon_id == gustavo.id,
+        )
+        q = _apply_exclude(q)
+        already = session.exec(q).all()
 
-@app.on_event("startup")
-def _init_db():
-    SQLModel.metadata.create_all(engine)
-    ensure_column(engine, "user", "vendedor", "TEXT")
-    ensure_column(engine, "user", "is_admin", "INTEGER DEFAULT 0")
-    create_admin_from_env()
+        if len(already) >= cap:
+            if cap == 2:
+                return "Regra: Dr. Gustavo Aquino não pode ter mais de 2 agendamentos no mesmo dia."
+            return "Regra: Dr. Gustavo Aquino não pode ter mais de 1 agendamento (Refinamento) na Sexta-feira."
 
-def list_payment_ignores(patient_id: int) -> list[PaymentIgnore]:
-    with Session(engine) as s:
-        return s.exec(select(PaymentIgnore).where(PaymentIgnore.patient_id == patient_id)).all()
-
-def payment_matches_ignore(p: dict, ign: PaymentIgnore) -> bool:
-    if ign.date and str(p.get("data")) != ign.date:
-        return False
-    if ign.valor is not None and float(p.get("valor") or 0.0) != float(ign.valor):
-        return False
-    if ign.forma and str(p.get("forma")) != str(ign.forma):
-        return False
-    return True
-
-def apply_payment_ignores(pagamentos: list[dict], patient_id: int) -> tuple[list[dict], list[dict]]:
-    ignores = list_payment_ignores(patient_id)
-    consumed: dict[int,int] = {ign.id: 0 for ign in ignores if ign.id is not None}
-    applied: list[dict] = []
-
-    out = []
-    for p in pagamentos:
-        ignored = False
-        for ign in ignores:
-            if payment_matches_ignore(p, ign):
-                c = consumed.get(ign.id or -1, 0)
-                if c < (ign.occurrences or 1):
-                    consumed[ign.id] = c + 1
-                    applied.append({"ignore_id": ign.id, "payment": p})
-                    ignored = True
-                    break
-        if not ignored:
-            out.append(p)
-    return out, applied
-
-def dedupe_payments(pagamentos: list[dict]) -> tuple[list[dict], list[dict]]:
-    """
-    Remove duplicações quando o MESMO pagamento aparece em mais de uma invoice.
-    Preferência:
-      - se houver 'uid', deduplica por uid
-      - senão, deduplica por (data, valor arredondado 2 casas, forma)
-    Retorna: (lista_deduplicada, lista_removidos_para_debug)
-    """
-    seen = set()
-    out: list[dict] = []
-    removed: list[dict] = []
-
-    for p in pagamentos or []:
-        if not isinstance(p, dict):
-            continue
-
-        uid = (p.get("uid") or "").strip() if isinstance(p.get("uid"), str) else p.get("uid")
-        data = str(p.get("data") or "").strip()
-        forma = str(p.get("forma") or "").strip()
-
-        try:
-            valor = round(float(p.get("valor") or 0.0), 2)
-        except Exception:
-            valor = 0.0
-
-        key = f"uid:{uid}" if uid else f"{data}|{valor:.2f}|{forma}".upper()
-
-        if key in seen:
-            removed.append(p)
-            continue
-
-        seen.add(key)
-        out.append(p)
-
-    return out, removed
-
-class FeegowClient:
-    def __init__(self) -> None:
-        self.base = os.getenv("FEEGOW_BASE", "https://api.feegow.com/v1/api").rstrip("/")
-        self.token = os.getenv("FEEGOW_TOKEN", "")
-        self.auth_header = os.getenv("FEEGOW_AUTH_HEADER", "x-access-token")
-        self.auth_scheme = os.getenv("FEEGOW_AUTH_SCHEME", "")  
-        self.client = httpx.Client(timeout=20.0, trust_env=True)
-        self._status_by_id: dict[int, str] = {}
-        self._status_last_fetch: float = 0.0
-
-    # ----------------- util -----------------
-    def _headers(self) -> Dict[str, str]:
-        if not self.token:
-            return {}
-        value = f"{self.auth_scheme} {self.token}".strip()
-        return {self.auth_header: value}
-
-    def _only_digits(self, s: str) -> str:
-        return re.sub(r"\D+", "", s or "")
-
-    def _norm_date(self, s: Optional[str]) -> Optional[str]:
-        """Converte 'dd-mm-aaaa' → 'aaaa-mm-dd' (quando necessário)."""
-        if not s or not isinstance(s, str):
-            return None
-        try:
-            d, m, y = s.split("-")
-            if len(y) == 4:
-                return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-        except Exception:
-            pass
-        return s
-
-    # ----------------- Paciente -----------------
-    def get_patient_name_by_id(self, patient_id: int) -> Optional[str]:
-        url = f"{self.base}/patient/search"
-        params = {"paciente_id": patient_id}
-        r = self.client.get(url, params=params, headers=self._headers())
-        r.raise_for_status()
-        data: Any = r.json()
-
-        if isinstance(data, dict):
-            if "content" in data and isinstance(data["content"], dict):
-                return data["content"].get("nome") or data["content"].get("name")
-            for key in ("data", "results", "result"):
-                if key in data and isinstance(data[key], list) and data[key]:
-                    item = data[key][0]
-                    return item.get("nome") or item.get("name")
-                if key in data and isinstance(data[key], dict):
-                    item = data[key]
-                    return item.get("nome") or item.get("name")
-            if "nome" in data:
-                return data["nome"]
         return None
 
-    def debug_patient_search(self, patient_id: int) -> Dict[str, Any]:
-        url = f"{self.base}/patient/search"
-        params = {"paciente_id": patient_id}
-        headers = self._headers()
-        redacted = {k: ("<set>" if v else "") for k, v in headers.items()}
-        try:
-            r = self.client.get(url, params=params, headers=headers)
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
-            return {
-                "request": {"url": url, "params": params, "headers": redacted},
-                "response": {"status_code": r.status_code, "body": body},
-            }
-        except Exception as e:
-            return {"request": {"url": url, "params": params, "headers": redacted}, "error": str(e)}
+    # =========================
+    # (B) Alice e Ricardo
+    # =========================
+    if alice and ricardo and surgeon_id in (alice.id, ricardo.id):
+        # dias permitidos: Ter/Qui/Sex
+        if wd not in (1, 3, 4):
+            return "Regra: Dra. Alice Osório e Dr. Ricardo Vilela operam apenas na Terça, Quinta ou Sexta."
 
-    def _extract_patient_from_search(self, data) -> tuple[int | None, str | None]:
-        """
-        Tenta extrair (id, nome) do retorno do /patient/search,
-        lidando com variações de estrutura.
-        """
-        if not isinstance(data, dict):
-            return None, None
-
-        content = data.get("content", data)
-
-        # 1) dict simples
-        if isinstance(content, dict):
-            pid = (content.get("id")
-                   or content.get("paciente_id")
-                   or content.get("patient_id"))
-            nome = (content.get("nome")
-                    or content.get("name"))
-            try:
-                return (int(pid), nome) if pid is not None else (None, nome)
-            except Exception:
-                return None, nome
-
-        # 2) lista de objetos
-        if isinstance(content, list) and content:
-            item = content[0]
-            if isinstance(item, dict):
-                pid = (item.get("id")
-                       or item.get("paciente_id")
-                       or item.get("patient_id"))
-                nome = (item.get("nome")
-                        or item.get("name"))
-                try:
-                    return (int(pid), nome) if pid is not None else (None, nome)
-                except Exception:
-                    return None, nome
-
-        # 3) outras variações comuns
-        for key in ("data", "results", "result"):
-            val = data.get(key)
-            if isinstance(val, list) and val:
-                item = val[0]
-                if isinstance(item, dict):
-                    pid = (item.get("id")
-                           or item.get("paciente_id")
-                           or item.get("patient_id"))
-                    nome = (item.get("nome")
-                            or item.get("name"))
-                    try:
-                        return (int(pid), nome) if pid is not None else (None, nome)
-                    except Exception:
-                        return None, nome
-            if isinstance(val, dict):
-                pid = (val.get("id")
-                       or val.get("paciente_id")
-                       or val.get("patient_id"))
-                nome = (val.get("nome")
-                        or val.get("name"))
-                try:
-                    return (int(pid), nome) if pid is not None else (None, nome)
-                except Exception:
-                    return None, nome
-
-        return None, None
-
-    def get_patient_id_by_cpf(self, cpf: str) -> int:
-        """
-        Busca o paciente pelo CPF e retorna o ID.
-        Tenta primeiro via query string (padrão), depois GET com JSON no corpo
-        (alguns ambientes Feegow aceitam isso).
-        """
-        cpf_num = self._only_digits(cpf)
-        if not cpf_num:
-            return 0
-
-        url = f"{self.base}/patient/search"
-
-        # 1) tentativa por query string
-        try:
-            r = self.client.get(url, params={"paciente_cpf": cpf_num}, headers=self._headers())
-            r.raise_for_status()
-            pid, _ = self._extract_patient_from_search(r.json())
-            if pid:
-                return pid
-        except Exception:
-            pass
-
-        # 2) fallback: GET com JSON no corpo (não usual, mas alguns exemplos usam)
-        try:
-            r = self.client.get(url, headers=self._headers(), json={"paciente_cpf": cpf_num})
-            r.raise_for_status()
-            pid, _ = self._extract_patient_from_search(r.json())
-            if pid:
-                return pid
-        except Exception:
-            pass
-
-        return 0
-
-    # por enquanto mantemos estático; depois trocamos por busca real
-    def get_patient_by_cpf(self, cpf: str) -> tuple[int | None, str | None]:
-        """Retorna (patient_id, nome) pelo CPF (combina as tentativas acima)."""
-        cpf_num = self._only_digits(cpf)
-        if not cpf_num:
-            return None, None
-        url = f"{self.base}/patient/search"
-        # query
-        try:
-            r = self.client.get(url, params={"paciente_cpf": cpf_num}, headers=self._headers())
-            r.raise_for_status()
-            pid, nome = self._extract_patient_from_search(r.json())
-            if pid:
-                return pid, nome
-        except Exception:
-            pass
-        # fallback json body
-        try:
-            r = self.client.get(url, headers=self._headers(), json={"paciente_cpf": cpf_num})
-            r.raise_for_status()
-            pid, nome = self._extract_patient_from_search(r.json())
-            if pid:
-                return pid, nome
-        except Exception:
-            pass
-        return None, None
-
-    # ----------------- Propostas -----------------
-    def _try_get(self, url: str, params: dict):
-        r = self.client.get(url, params=params, headers=self._headers())
-        r.raise_for_status()
-        return r.json()
-
-    def get_proposals_by_patient(self, patient_id: int, status_filter: Optional[str] = None):
-        url = f"{self.base}/proposal/list"
-        try:
-            data = self._try_get(url, {"PacienteID": patient_id})
-        except Exception:
-            data = self._try_get(url, {"paciente_id": patient_id})
-
-        content = data.get("content") if isinstance(data, dict) else None
-        if not isinstance(content, list):
-            return []
-
-        proposals = []
-        target = (status_filter or "").strip().lower()
-
-        for p in content:
-            # pega o texto do status em qualquer variação comum
-            status_txt = (
-                p.get("status")
-                or p.get("status_nome")
-                or p.get("status_name")
-                or p.get("situacao")
-                or p.get("proposal_status")
-                or ""
-            )
-            status_norm = str(status_txt).strip().lower()
-
-            # se pediram filtro e não bateu, pula
-            if target and target not in status_norm:
-                continue
-
-            valor = p.get("value", 0) or 0
-            itens = []
-            proc = p.get("procedimentos", {})
-            rows = proc.get("data") if isinstance(proc, dict) else None
-            if isinstance(rows, list):
-                for it in rows:
-                    itens.append({
-                        "nome": it.get("nome", ""),
-                        "valor": float(it.get("valor", 0) or 0),
-                    })
-
-            raw_date = (
-                p.get("proposal_date")
-                or p.get("date")
-                or p.get("data")
-                or p.get("created_at")
-                or p.get("dt_proposta")
-            )
-
-            proposals.append({
-                "proposal_id": p.get("proposal_id"),
-                "proposal_date": self._norm_date(raw_date),
-                "valor": float(valor),
-                "itens": itens,
-                "status": status_txt,          # (útil para depurar/exibir, se quiser)
-            })
-        return proposals
-
-    # ----------------- Traduções de IDs -----------------
-    _proc_cache: Dict[int, str] = {}
-    _prof_cache: Dict[int, str] = {}
-    _status_cache: Dict[int, str] = {}
-
-    def get_procedure_name(self, procedure_id: int) -> Optional[str]:
-        if not procedure_id:
-            return None
-        # cache por ID
-        if procedure_id in self._proc_cache:
-            return self._proc_cache[procedure_id]
-
-        url = f"{self.base}/procedures/list"
-        r = self.client.get(
-            url,
-            params={"procedure_id": procedure_id},  # se a API ignorar, tratamos abaixo
-            headers=self._headers()
+        # capacidade do próprio médico: 1 por dia
+        q_self = select(SurgicalMapEntry.id).where(
+            SurgicalMapEntry.day == day,
+            SurgicalMapEntry.surgeon_id == surgeon_id,
         )
-        r.raise_for_status()
-        data = r.json()
+        q_self = _apply_exclude(q_self)
+        if session.exec(q_self).first():
+            return "Regra: Dra. Alice Osório e Dr. Ricardo Vilela não podem ter mais de 1 procedimento no mesmo dia."
 
-        nm: Optional[str] = None
-        if isinstance(data, dict):
-            c = data.get("content")
-
-            # quando volta um único objeto:
-            if isinstance(c, dict):
-                nm = c.get("nome") or c.get("procedure") or c.get("name")
-
-            # quando volta uma lista de objetos:
-            elif isinstance(c, list) and c:
-                alvo = None
-                for item in c:
-                    try:
-                        pid = (
-                            item.get("procedimento_id")
-                            or item.get("procedure_id")
-                            or item.get("id")
-                        )
-                        if pid is not None and int(pid) == int(procedure_id):
-                            alvo = item
-                            break
-                    except Exception:
-                        continue
-                # se achou o item correto, usa o nome dele;
-                # senão, pelo menos não quebra (usa o primeiro como fallback)
-                base = alvo if alvo is not None else c[0]
-                nm = base.get("nome") or base.get("procedure") or base.get("name")
-
-        if nm:
-            self._proc_cache[procedure_id] = nm
-        return nm
-
-    def get_professional_name(self, professional_id: int) -> Optional[str]:
-        if not professional_id:
-            return None
-        if professional_id in self._prof_cache:
-            return self._prof_cache[professional_id]
-
-        url = f"{self.base}/professional/list"
-        r = self.client.get(url, params={"professional_id": professional_id}, headers=self._headers())
-        r.raise_for_status()
-        data = r.json()
-        nm: Optional[str] = None
-        if isinstance(data, dict):
-            c = data.get("content")
-
-            if isinstance(c, dict):
-                nm = c.get("nome") or c.get("name")
-            elif isinstance(c, list) and c:
-                alvo = None
-                for item in c:
-                    try:
-                        pid = (
-                            item.get("profissional_id")
-                            or item.get("professional_id")
-                            or item.get("id")
-                        )
-                        if pid is not None and int(pid) == int(professional_id):
-                            alvo = item
-                            break
-                    except Exception:
-                        continue
-                base = alvo if alvo is not None else c[0]  # fallback para não quebrar
-                nm = base.get("nome") or base.get("name")
-
-        if nm:
-            self._prof_cache[professional_id] = nm
-        return nm
-
-    def _ensure_status_map(self, max_age_seconds: int = 3600):
-        """
-        Garante que o mapa de status esteja carregado da API e não esteja velho.
-        Por padrão, refresca a cada 1h.
-        """
-        import time
-        now = time.time()
-        if self._status_by_id and (now - self._status_last_fetch) < max_age_seconds:
-            return  # cache ainda válido
-
-        try:
-            url = f"{self.base}/appoints/status"
-            r = self.client.get(url, headers=self._headers(), timeout=30)
-            r.raise_for_status()
-            data = r.json()
-
-            mapping: dict[int, str] = {}
-            content = (data or {}).get("content")
-            if isinstance(content, list):
-                for it in content:
-                    try:
-                        sid = int(it.get("status_id") or it.get("id") or 0)
-                        name = (it.get("nome") or it.get("name") or it.get("status") or "").strip()
-                        if sid and name:
-                            mapping[sid] = name
-                    except Exception:
-                        pass
-
-            if mapping:
-                self._status_by_id = mapping
-                self._status_last_fetch = now
-        except Exception:
-            # se der erro, mantém o cache anterior (se houver) e segue a vida
-            pass
-
-    def get_status_name(self, status_id: int) -> str | None:
-        """
-        Retorna o nome do status compatível com o Feegow.
-        Tenta via cache/API; se não conseguir, devolve algo genérico.
-        """
-        if not status_id:
-            return None
-        self._ensure_status_map()
-        name = self._status_by_id.get(int(status_id))
-        if name:
-            return name
-        # fallback ultra genérico, apenas para não quebrar UI
-        return f"Status #{int(status_id)}"
-
-    # ----------------- Agenda (janelas simples) -----------------
-    def get_appointments_window(self, patient_id: int, days_before: int = 90, days_after: int = 90) -> List[Dict[str, Any]]:
-        today = date.today()
-        start = today - timedelta(days=abs(days_before))
-        end = today + timedelta(days=abs(days_after))
-
-        # Garanta <= 180 dias (Feegow reclama se ultrapassar)
-        while (end - start).days > 180:
-            end -= timedelta(days=1)
-
-        fmt = lambda dt: dt.strftime("%d-%m-%Y")
-        params = {"data_start": fmt(start), "data_end": fmt(end), "paciente_id": patient_id}
-
-        url = f"{self.base}/appoints/search"
-        r = self.client.get(url, params=params, headers=self._headers())
-        r.raise_for_status()
-        data = r.json()
-
-        content = data.get("content") if isinstance(data, dict) else None
-        if not isinstance(content, list):
-            return []
-
-        appts = []
-        for a in content:
-            appts.append({
-                "agendamento_id": a.get("agendamento_id"),
-                "data": self._norm_date(a.get("data") or a.get("date")),
-                "hora": a.get("hora") or a.get("hour") or a.get("time"),
-                "horario": a.get("horario") or a.get("hora") or a.get("hour") or a.get("time"),
-                "procedimento_id": a.get("procedimento_id") or a.get("procedure_id"),
-                "status_id": a.get("status_id"),
-                "profissional_id": a.get("profissional_id") or a.get("professional_id"),
-            })
-        return appts
-
-    # ----------------- Agenda (período arbitrário costurado) -----------------
-    def _feegow_search(self, patient_id: int, start: date, end: date) -> List[Dict[str, Any]]:
-        """Chama /appoints/search para [start, end] (<= 180 dias) e normaliza a saída."""
-        fmt = lambda dt: dt.strftime("%d-%m-%Y")
-        params = {"data_start": fmt(start), "data_end": fmt(end), "paciente_id": patient_id}
-        url = f"{self.base}/appoints/search"
-        r = self.client.get(url, params=params, headers=self._headers())
-        r.raise_for_status()
-        data = r.json()
-        content = data.get("content") if isinstance(data, dict) else None
-        if not isinstance(content, list):
-            return []
-        out: List[Dict[str, Any]] = []
-        for a in content:
-            out.append({
-                "agendamento_id": a.get("agendamento_id"),
-                "data": self._norm_date(a.get("data") or a.get("date")),
-                "hora": a.get("hora") or a.get("hour") or a.get("time"),
-                "horario": a.get("horario") or a.get("hora") or a.get("hour") or a.get("time"),
-                "procedimento_id": a.get("procedimento_id") or a.get("procedure_id"),
-                "status_id": a.get("status_id"),
-                "profissional_id": a.get("profissional_id") or a.get("professional_id"),
-                
-                # >>> NOVIDADE: carregar o nome cru que a Feegow já retorna na busca
-                "profissional_nome_raw": (
-                    a.get("profissional_nome")
-                    or a.get("professional_name")
-                    or a.get("profissional")
-                    or a.get("professional")
-                ),
-                # (se a API já trouxer o nome do procedimento, é bom preservar também)
-                "procedimento_nome_raw": (
-                    a.get("procedimento_nome")
-                    or a.get("procedure_name")
-                    or a.get("procedimento")
-                    or a.get("procedure")
-                ),
-            })
-        return out
-
-    def _get_status_map(self):
-        """
-        Busca e cacheia o mapa {status_id: nome} de /v1/api/appoints/status.
-        """
-        if "status_map" in self.cache:
-            return self.cache["status_map"]
-
-        url = f"{self.base}/v1/api/appoints/status"
-        r = requests.get(url, headers=self._headers())
-        data = r.json() if r.content else {}
-
-        status_map = {}
-        if isinstance(data, dict) and data.get("success") and isinstance(data.get("content"), list):
-            for s in data["content"]:
-                # tenta id/nome nos campos mais comuns
-                sid = s.get("status_id") or s.get("id") or s.get("status") or s.get("codigo")
-                nome = s.get("nome") or s.get("name") or s.get("descricao") or s.get("description")
-                if sid is not None and nome:
-                    status_map[int(sid)] = str(nome)
-
-        self.cache["status_map"] = status_map
-        return status_map
-
-    def get_appointments_range(self, patient_id: int, start: date, end: date) -> Dict[str, Any]:
-        """
-        Costura várias janelas de até 180 dias entre 'start' e 'end'.
-        Retorna {'items': [...], 'windows': [(start,end), ...]}.
-        """
-        if end < start:
-            start, end = end, start
-
-        max_span = 180  # dias
-        items: Dict[Any, Dict[str, Any]] = {}  # dedupe por agendamento_id
-        windows: List[Dict[str, str]] = []
-
-        cur = start
-        while cur <= end:
-            win_end = min(cur + timedelta(days=max_span - 1), end)
-            windows.append({"start": cur.isoformat(), "end": win_end.isoformat()})
-            chunk = self._feegow_search(patient_id, cur, win_end)
-            for ap in chunk:
-                key = ap.get("agendamento_id") or (ap.get("data"), ap.get("horario"), ap.get("procedimento_id"))
-                items[key] = ap
-            cur = win_end + timedelta(days=1)
-
-        return {"items": list(items.values()), "windows": windows}
-
-    def _is_generic_prof_name(self, name: str | None) -> bool:
-        if not name:
-            return True
-        n = name.strip().upper()
-        # ajuste a lista conforme sua base
-        return (
-            n in {"ADMINISTRATIVO", "ADMINISTRATIVA", "RECEPÇÃO", "RECEPCAO"}
-            or "ADMIN" in n
+        # conflito Alice x Ricardo: se o outro tem qualquer agendamento/reserva no dia, bloqueia
+        other_id = ricardo.id if surgeon_id == alice.id else alice.id
+        q_other = select(SurgicalMapEntry.id).where(
+            SurgicalMapEntry.day == day,
+            SurgicalMapEntry.surgeon_id == other_id,
         )
+        q_other = _apply_exclude(q_other)
+        if session.exec(q_other).first():
+            return "Regra: Dra. Alice Osório e Dr. Ricardo Vilela não podem operar no mesmo dia."
 
-    def _hydrate_appointments(self, appts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not appts:
-            return []
+        return None
 
-        proc_ids   = sorted({a.get("procedimento_id")  for a in appts if a.get("procedimento_id")})
-        prof_ids   = sorted({a.get("profissional_id")  for a in appts if a.get("profissional_id")})
-        status_ids = sorted({a.get("status_id")        for a in appts if a.get("status_id")})
-
-        proc_map   = {pid: self.get_procedure_name(pid)    for pid in proc_ids}
-        prof_map   = {pid: self.get_professional_name(pid) for pid in prof_ids}
-        status_map = {sid: self.get_status_name(sid)       for sid in status_ids}
-
-        hydrated: List[Dict[str, Any]] = []
-        for a in appts:
-            data_raw = (a.get("data") or "").strip()
-            data_iso = data_raw
-            try:
-                d, m, y = data_raw.split("-")
-                data_iso = f"{y}-{m}-{d}"
-            except Exception:
-                pass
-
-            proc_id = a.get("procedimento_id")
-            prof_id = a.get("profissional_id")
-            st_id   = a.get("status_id")
-
-            # nomes vindos de mapas (traduções por ID)
-            proc_name_from_id = proc_map.get(proc_id)
-            prof_name_from_id = prof_map.get(prof_id)
-
-            # nomes crus vindos da própria busca de agendamentos
-            proc_name_raw = a.get("procedimento_nome_raw")
-            prof_name_raw = a.get("profissional_nome_raw")
-
-            # regra: preferir nome cru se existir e não for genérico
-            prof_final = None
-            if prof_name_raw and not self._is_generic_prof_name(prof_name_raw):
-                prof_final = prof_name_raw
-            elif prof_name_from_id and not self._is_generic_prof_name(prof_name_from_id):
-                prof_final = prof_name_from_id
-            # 2) se só houver genéricos, mostre o que existir (para não ficar em branco)
-            if not prof_final:
-                prof_final = prof_name_raw or prof_name_from_id
-
-            # nome do procedimento: bruto > por ID > fallback
-            proc_final = proc_name_raw or proc_name_from_id or "Procedimento"
-
-            hydrated.append({
-                "agendamento_id": a.get("agendamento_id"),
-                "data": a.get("data"),
-                "horario": a.get("horario") or a.get("hora"),
-                "procedimento_id": proc_id,
-                "procedimento_nome": proc_final or "Procedimento",
-                "status_id": st_id,
-                "status_nome": status_map.get(st_id),
-                "profissional_id": prof_id,
-                "profissional_nome": prof_final,  # <—— agora deve vir "Gustavo Aquino" quando disponível
-                "status": status_map.get(st_id, f"#{st_id}"),
-            })
-        return hydrated
-
-    def get_appointments_range_hydrated(self, patient_id: int, start: date, end: date) -> Dict[str, Any]:
-        stitched = self.get_appointments_range(patient_id, start, end)
-        stitched["items"] = self._hydrate_appointments(stitched["items"])
-        return stitched
-    
-
-    # ----------------- debug helpers -----------------
-    def debug_appoints(self, patient_id: int, days_before: int = 90, days_after: int = 90):
-        today = date.today()
-        start = today - timedelta(days=abs(days_before))
-        end = today + timedelta(days=abs(days_after))
-        while (end - start).days > 180:
-            end -= timedelta(days=1)
-        fmt = lambda dt: dt.strftime("%d-%m-%Y")
-        params = {"data_start": fmt(start), "data_end": fmt(end), "paciente_id": patient_id}
-        url = f"{self.base}/appoints/search"
-        headers = self._headers()
-        redacted = {k: ("<set>" if v else "") for k, v in headers.items()}
-        try:
-            r = self.client.get(url, params=params, headers=headers)
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
-            return {"request": {"url": url, "params": params, "headers": redacted},
-                    "response": {"status_code": r.status_code, "body": body}}
-        except Exception as e:
-            return {"request": {"url": url, "params": params, "headers": redacted},
-                    "error": str(e)}
-    
-    
-    def get_invoice_payments(
-        self,
-        invoice_id: str,
-        data_start: str = "01-01-2000",
-        data_end: str   = "31-08-2050",
-        tipo_transacao: str = "C",
-    ) -> list[dict]:
-        url = f"{self.base}/financial/list-invoice"
-        params = {
-            "data_start": data_start,
-            "data_end": data_end,
-            "tipo_transacao": tipo_transacao,
-            "invoice_id": str(invoice_id),
-        }
-        r = self.client.get(url, params=params, headers=self._headers(), timeout=30)
-        r.raise_for_status()
-        raw = r.json()
-
-        # ---- procura robusta pela lista de pagamentos ----
-        rows = []
-
-        def deep_find_pagamentos(obj):
-            # retorna a primeira lista sob a chave 'pagamentos' encontrada em qualquer nível
-            if isinstance(obj, dict):
-                if isinstance(obj.get("pagamentos"), list):
-                    return obj["pagamentos"]
-                for v in obj.values():
-                    found = deep_find_pagamentos(v)
-                    if isinstance(found, list):
-                        return found
-            elif isinstance(obj, list):
-                # às vezes vem content=[{pagamentos:[...]}]
-                for v in obj:
-                    found = deep_find_pagamentos(v)
-                    if isinstance(found, list):
-                        return found
-            return None
-
-        # 1) tenta achar 'pagamentos' em qualquer nível
-        rows = deep_find_pagamentos(raw) or []
-
-        # 2) fallbacks comuns (alguns ambientes retornam direto uma lista)
-        if not rows:
-            if isinstance(raw, list):
-                rows = raw
-            elif isinstance(raw, dict):
-                # content ou data podem ser listas ou dicts
-                c = raw.get("content")
-                d = raw.get("data")
-                if isinstance(c, list):
-                    rows = c
-                elif isinstance(d, list):
-                    rows = d
-                elif isinstance(d, dict):
-                    rows = d.get("pagamentos") if isinstance(d.get("pagamentos"), list) else []
-
-        out: list[dict] = []
-        for it in rows or []:
-            if not isinstance(it, dict):
-                continue
-
-            dt_raw = (
-                it.get("data_pagamento")
-                or it.get("data")
-                or it.get("dt_pagamento")
-                or it.get("payment_date")
-            )
-            dt_norm = self._norm_date(str(dt_raw)) if dt_raw else None
-
-            valor = self._money_to_float(
-                it.get("valor_pago")
-                or it.get("valor")
-                or it.get("vl_pago")
-                or it.get("amount")
-            )
-
-            forma = (
-                it.get("forma_pagamento_nome")
-                or it.get("forma_pagamento")
-                or it.get("forma")
-                or it.get("payment_method")
-                or "—"
-            )
-
-            if dt_norm and valor:
-                # tenta pegar um identificador único quando existir
-                uid = (
-                    it.get("id")
-                    or it.get("payment_id")
-                    or it.get("pagamento_id")
-                    or it.get("lancamento_id")
-                    or it.get("movimento_id")
-                    or it.get("titulo_id")
-                )
-
-                if dt_norm and valor:
-                    out.append({
-                        "data": dt_norm,
-                        "valor": float(valor),
-                        "forma": str(forma),
-                        "uid": str(uid) if uid is not None else None,   # << novo
-                        "invoice_id": str(invoice_id),                  # << novo (rastreabilidade)
-                    })
-
-        out.sort(key=lambda x: x["data"])
-        return out
-
-    def _money_to_float(self, valor) -> float:
-        """
-        Normaliza valores monetários vindos do Feegow.
-        - Quando vier inteiro/strings só com dígitos, geralmente está em CENTAVOS (ex.: 155675 = 1556.75).
-        - Quando vier float com casas decimais, assume que já está em reais.
-        """
-        if valor is None:
-            return 0.0
-
-        # número
-        if isinstance(valor, (int, float)):
-            # float com casas -> já está em reais
-            if isinstance(valor, float) and not valor.is_integer():
-                return float(valor)
-
-            n = int(valor)  # int puro ou float .0
-            # Heurística melhor: >= 100 (3+ dígitos) normalmente indica centavos
-            # (ex.: 155675 -> 1556.75, 5000 -> 50.00, 150 -> 1.50)
-            if abs(n) >= 100:
-                return n / 100.0
-            return float(n)
-
-        s = str(valor).strip()
-        if not s:
-            return 0.0
-
-        # string só com dígitos -> provavelmente centavos
-        if s.isdigit():
-            n = int(s)
-            if len(s) >= 3:  # 100+ => centavos
-                return n / 100.0
-            return float(n)
-
-        # string com separadores BR/US
-        s = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
-
-    def debug_list_invoice(self, invoice_id: str,
-                            data_start: str = "01-01-2000",
-                            data_end: str   = "31-08-2050",
-                            tipo_transacao: str = "C") -> dict:
-        url = f"{self.base}/financial/list-invoice"
-        params = {
-            "data_start": data_start,
-            "data_end": data_end,
-            "tipo_transacao": tipo_transacao,
-            "invoice_id": str(invoice_id),
-        }
-        headers = self._headers()
-        redacted = {k: ("<set>" if v else "") for k, v in headers.items()}
-        try:
-            r = self.client.get(url, params=params, headers=headers, timeout=30)
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
-            return {
-                "request": {"url": url, "params": params, "headers": redacted},
-                "response": {"status_code": r.status_code, "body": body},
-            }
-        except Exception as e:
-            return {"request": {"url": url, "params": params, "headers": redacted},
-                    "error": str(e)}
-
-feegow = FeegowClient()
-
-# ====== Sessão (cookie HttpOnly) ======
-SECRET = os.getenv("SESSION_SECRET", "troque-isto")
-
-def make_token(cpf: str, ttl_seconds=60*60*8) -> str:
-    exp = int(time.time()) + ttl_seconds
-    msg = f"{cpf}.{exp}".encode()
-    sig = hmac.new(SECRET.encode(), msg, hashlib.sha256).digest()
-    return f"{cpf}.{exp}.{base64.urlsafe_b64encode(sig).decode()}"
-
-def parse_token(tok: str) -> str | None:
-    try:
-        cpf, exp, sig_b64 = tok.split(".")
-        exp = int(exp)
-        if exp < int(time.time()):
-            return None
-        msg = f"{cpf}.{exp}".encode()
-        sig_ok = hmac.new(SECRET.encode(), msg, hashlib.sha256).digest()
-        if hmac.compare_digest(sig_ok, base64.urlsafe_b64decode(sig_b64)):
-            return cpf
-    except Exception:
-        pass
+    # Outros cirurgiões (se existirem) sem regras específicas aqui
     return None
 
-def current_user(request: Request) -> str:
-    tok = request.cookies.get("pp_session")
-    cpf = parse_token(tok or "")
-    if not cpf:
-        raise HTTPException(status_code=401, detail="Não autenticado")
-    return cpf
+# ============================================================
+# HOSPEDAGEM (2 suítes + 1 apartamento) - reservas por período
+# check_out é NÃO inclusivo (data de saída)
+# ============================================================
 
-# ------------------------------------------------------------------
-# Rotas principais
-# ------------------------------------------------------------------
-class LoginDTO(BaseModel):
-    cpf: str
-    password: str
-
-@app.post("/auth/login")
-def login(body: LoginDTO):
-    cpf = re.sub(r"\D+", "", body.cpf or "")
-    user = get_user(cpf)
-    if not user or not verify_pw(body.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Credenciais inválidas")
-
-    if not getattr(user, "is_admin", False):
-        pid, _ = feegow.get_patient_by_cpf(cpf)
-        if not pid:
-            raise HTTPException(status_code=404, detail="CPF não encontrado")
-
-    resp = JSONResponse({"ok": True, "is_admin": bool(getattr(user, "is_admin", False))})
-    tok = make_token(cpf)
-    resp.set_cookie("pp_session", tok, httponly=True, secure=True, samesite="lax",
-                    max_age=60*60*8, path="/")
-    return resp
+def validate_lodging_period(check_in: date, check_out: date) -> Optional[str]:
+    if not check_in or not check_out:
+        return "Informe check-in e check-out."
+    if check_out <= check_in:
+        return "Período inválido: check-out deve ser após check-in."
+    return None
 
 
-@app.post("/auth/logout")
-def logout():
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("pp_session", path="/")
-    return resp
+def validate_lodging_conflict(
+    session: Session,
+    unit: str,
+    check_in: date,
+    check_out: date,
+    exclude_id: Optional[int] = None,
+) -> Optional[str]:
+    # conflito se: novo_in < existente_out AND novo_out > existente_in
+    q = select(LodgingReservation).where(
+        LodgingReservation.unit == unit,
+        LodgingReservation.check_in < check_out,
+        LodgingReservation.check_out > check_in,
+    )
+    if exclude_id is not None:
+        q = q.where(LodgingReservation.id != exclude_id)
 
-@app.get("/auth/me")
-def auth_me(cpf: str = Depends(current_user)):
-    u = get_user(cpf)
+    exists = session.exec(q).first()
+    if exists:
+        return "Hospedagem indisponível: já existe reserva nesse período para esta acomodação."
+    return None
 
-    if u and getattr(u, "is_admin", False):
-        pid, nome = 0, (u.nome or "")
-    else:
-        pid, nome = feegow.get_patient_by_cpf(cpf)
 
+def human_unit(unit: str) -> str:
     return {
-        "cpf": cpf,
-        "name": nome or (u.nome if u else ""),
-        "patient_id": pid or 0,
-        "vendedor": (u.vendedor if u else None),
-        "wa_number": SELLER_WA.get(u.vendedor if u else None),
-        "is_admin": bool(getattr(u, "is_admin", False)) if u else False,
+        "suite_1": "Suíte 1",
+        "suite_2": "Suíte 2",
+        "apto": "Apartamento",
+    }.get(unit, unit)
+
+def _weekday_pt(idx: int) -> str:
+    names = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+    return names[idx]
+
+# ============================
+# RELATÓRIO DR. GUSTAVO (snapshot diário às 19h)
+# ============================
+
+PT_MONTHS = [
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"
+]
+DOW_ABBR = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+
+def _add_months(year: int, month: int, delta: int) -> tuple[int, int]:
+    """Soma delta meses em (year, month). Retorna (new_year, new_month)."""
+    m = month + delta
+    y = year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    return y, m
+
+def _month_start(year: int, month: int) -> date:
+    return date(year, month, 1)
+
+def _month_end(year: int, month: int) -> date:
+    import calendar as _cal
+    last_day = _cal.monthrange(year, month)[1]
+    return date(year, month, last_day)
+
+def _month_label_pt(year: int, month: int) -> str:
+    # você pode escolher title() no display
+    return PT_MONTHS[month-1].upper()
+
+def _proc_bucket(procedure_type: str | None) -> str:
+    """
+    Retorna 'cir' | 'ref' | 'simp' baseado no texto.
+    - Cirurgia: 'cirurgia'
+    - Refinamento: contém 'ref'
+    - Procedimento simples: contém 'simp' ou 'proced'
+    """
+    if not procedure_type:
+        return "cir"
+    pt = procedure_type.strip().lower()
+    if pt == "cirurgia":
+        return "cir"
+    if "ref" in pt:
+        return "ref"
+    if "simp" in pt or "proced" in pt:
+        return "simp"
+    return "cir"
+
+def build_gustavo_whatsapp_messages(session: Session, snapshot_day_sp: date) -> tuple[str, str, dict]:
+    """
+    Gera as duas mensagens (Panorama + Detalhe 3 meses)
+
+    Regras:
+    - meses fechados: mês atual + 2
+    - Seg/Qua sempre aparecem
+    - Sex só aparece se houver agendamento
+    - Emojis: ✅ cheio | 🟡 parcial | 🔴 livre | 🔵 bloqueio/recesso
+    - Descrição (linha 2) só aparece quando há Ref ou Proc. simples
+      (se for só Cirurgia, não mostra detalhamento)
+    """
+
+    gustavo = session.exec(select(User).where(User.username == "drgustavo")).first()
+    if not gustavo:
+        raise RuntimeError("Usuário drgustavo não encontrado no banco.")
+
+    y0, m0 = snapshot_day_sp.year, snapshot_day_sp.month
+    months = [(y0, m0), _add_months(y0, m0, 1), _add_months(y0, m0, 2)]
+
+    period_start = _month_start(months[0][0], months[0][1])
+    period_end = _month_end(months[-1][0], months[-1][1])
+
+    # carrega tudo do período (performance)
+    entries = session.exec(
+        select(SurgicalMapEntry).where(
+            SurgicalMapEntry.surgeon_id == gustavo.id,
+            SurgicalMapEntry.day >= period_start,
+            SurgicalMapEntry.day <= period_end,
+        )
+    ).all()
+
+    by_day: dict[date, list[SurgicalMapEntry]] = {}
+    for e in entries:
+        by_day.setdefault(e.day, []).append(e)
+
+    pano_lines: list[str] = [
+        "AGENDA DR. GUSTAVO AQUINO",
+        f"📅 {PT_MONTHS[months[0][1]-1].title()} • {PT_MONTHS[months[1][1]-1].title()} • {PT_MONTHS[months[2][1]-1].title()}",
+        ""
+    ]
+
+    detail_parts: list[str] = []
+    months_payload = []
+
+    for (yy, mm) in months:
+        m_start = _month_start(yy, mm)
+        m_end = _month_end(yy, mm)
+
+        lines: list[str] = []
+        prev_day: date | None = None
+        counts = {"✅": 0, "🟡": 0, "🔴": 0, "🔵": 0}
+
+        d = m_start
+        while d <= m_end:
+            dow = d.weekday()  # 0=Mon
+            is_mon_wed = dow in (0, 2)
+            is_fri = dow == 4
+
+            day_entries = by_day.get(d, [])
+
+            # sexta só aparece se tiver agendamento
+            if not is_mon_wed and not (is_fri and day_entries):
+                d += timedelta(days=1)
+                continue
+
+            # bloqueio? (seg/qua sempre consideram)
+            block_reason = validate_mapa_block_rules(session, d, gustavo.id)
+            if block_reason:
+                emoji = "🔵"
+            else:
+                total = len(day_entries)  # conta reservas também (se está reservado, não dá pra vender)
+                if is_fri:
+                    emoji = "🟡" if total >= 1 else "🔴"
+                else:
+                    if total >= 2:
+                        emoji = "✅"
+                    elif total == 1:
+                        emoji = "🟡"
+                    else:
+                        emoji = "🔴"
+
+            counts[emoji] += 1
+
+            # quebra visual entre semanas
+            if prev_day is not None and (d - prev_day).days > 3:
+                lines.append("")
+
+            lines.append(f"{DOW_ABBR[dow]} {d.strftime('%d/%m')}  {emoji}")
+
+            # descrição só se houver refino ou procedimento simples (para ficar limpo)
+            if emoji != "🔵" and day_entries:
+                cir = ref = simp = 0
+                for e in day_entries:
+                    b = _proc_bucket(e.procedure_type)
+                    if b == "ref":
+                        ref += 1
+                    elif b == "simp":
+                        simp += 1
+                    else:
+                        cir += 1
+
+                if ref > 0 or simp > 0:
+                    parts = []
+                    if cir:
+                        parts.append(f"{cir} Cir")
+                    if ref:
+                        parts.append(f"{ref} Ref")
+                    if simp:
+                        parts.append(f"{simp} Simp")
+                    lines.append(f"({ ' + '.join(parts) })")
+
+            prev_day = d
+            d += timedelta(days=1)
+
+        # Panorama do mês
+        pano_lines.append(_month_label_pt(yy, mm))
+        pano_lines.append(f"✅ {counts['✅']}")
+        pano_lines.append(f"🟡 {counts['🟡']}")
+        pano_lines.append(f"🔴 {counts['🔴']}")
+        pano_lines.append(f"🔵 {counts['🔵']}")
+        pano_lines.append("")
+
+        # Detalhe do mês
+        detail_parts.append(_month_label_pt(yy, mm))
+        detail_parts.append("")
+        detail_parts.extend(lines)
+        detail_parts.append("")
+
+        months_payload.append({
+            "year": yy,
+            "month": mm,
+            "label": _month_label_pt(yy, mm),
+            "counts": counts,
+            "lines": lines,
+        })
+
+    message_1 = "\n".join(pano_lines).strip()
+    message_2 = "\n".join(detail_parts).strip()
+
+    payload = {
+        "doctor_username": "drgustavo",
+        "snapshot_day_sp": snapshot_day_sp.isoformat(),
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "months": months_payload,
     }
 
-def require_admin(cpf: str = Depends(current_user)) -> User:
-    u = get_user(cpf)
-    if not u or not getattr(u, "is_admin", False):
-        raise HTTPException(status_code=403, detail="Acesso restrito ao admin")
-    return u
+    return message_1, message_2, payload
 
-class AdminCreateUserDTO(BaseModel):
-    nome: str
-    cpf: str
-    invoice_id: str
-    vendedor: Optional[str] = None
-
-@app.post("/admin/users")
-def admin_create_user(body: AdminCreateUserDTO, admin: User = Depends(require_admin)):
-    cpf = re.sub(r"\D+", "", body.cpf or "")
-    if len(cpf) != 11:
-        raise HTTPException(status_code=422, detail="CPF inválido (11 dígitos)")
-
-    nome = (body.nome or "").strip()
-    invoice_id = (body.invoice_id or "").strip()
-    vendedor = (body.vendedor or None)
-    if vendedor is not None:
-        vendedor = vendedor.strip() or None
-
-    if not nome:
-        raise HTTPException(status_code=422, detail="Nome é obrigatório")
-    if not invoice_id:
-        raise HTTPException(status_code=422, detail="Invoice é obrigatória")
-
-    with Session(engine) as s:
-        u = s.get(User, cpf)
-        if not u:
-            u = User(cpf=cpf, nome=nome, password_hash=hash_pw(cpf), vendedor=vendedor, is_admin=False)
-            s.add(u)
-            s.commit()
-        else:
-            u.nome = nome
-            u.vendedor = vendedor
-            s.add(u)
-            s.commit()
-
-        existing = s.exec(select(Invoice).where(Invoice.cpf == cpf, Invoice.invoice_id == invoice_id)).first()
-        if not existing:
-            s.add(Invoice(cpf=cpf, invoice_id=invoice_id))
-            s.commit()
-
-    return {"ok": True, "cpf": cpf, "invoice_id": invoice_id}
-
-@app.get("/admin/users")
-def admin_list_users(limit: int = Query(50, ge=1, le=200), admin: User = Depends(require_admin)):
-    with Session(engine) as s:
-        users = s.exec(select(User).order_by(User.cpf.desc()).limit(limit)).all()
-        data = []
-        for u in users:
-            invs = s.exec(select(Invoice.invoice_id).where(Invoice.cpf == u.cpf)).all()
-            data.append({
-                "cpf": u.cpf,
-                "nome": u.nome,
-                "vendedor": u.vendedor,
-                "is_admin": bool(getattr(u, "is_admin", False)),
-                "invoices": invs,
-            })
-        return {"ok": True, "users": data}
-
-@app.get("/patient/{patient_id}/summary")
-def summary(
-    patient_id: int, 
-    debug: int = Query(0),
-    invoice_id: Optional[str] = Query(None, description="Invoice ID para buscar pagamentos"),
-    pay_start: str = Query("01-01-2000"),
-    pay_end:   str = Query("31-08-2050"),
-    cpf_session: str = Depends(current_user),       # <— NOVO
-):
-    my_pid, _ = feegow.get_patient_by_cpf(cpf_session)
-    if my_pid != patient_id:
-        raise HTTPException(status_code=403, detail="Acesso negado")
+def _whatsapp_send(message_1: str, message_2: str) -> None:
     """
-    Monta o resumo. Propostas vêm do Feegow (proposal/list).
-    Pagamentos/agendamentos permanecem stub em parte.
+    Disparo via API (opcional).
+    Só envia se WHATSAPP_API_URL / WHATSAPP_API_TOKEN / WHATSAPP_TO estiverem configuradas.
     """
-    # Propostas reais
-    propostas = []
+    import requests
+
+    url = os.getenv("WHATSAPP_API_URL", "").strip()
+    token = os.getenv("WHATSAPP_API_TOKEN", "").strip()
+    to = os.getenv("WHATSAPP_TO", "").strip()
+
+    if not url or not token or not to:
+        audit_logger.info("WHATSAPP: envio ignorado (WHATSAPP_API_URL/TOKEN/TO não configurados).")
+        return
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Ajuste conforme seu provedor (BotConversa/Twilio/etc.)
+    payload = {"to": to, "messages": [message_1, message_2]}
+
     try:
-        propostas = feegow.get_proposals_by_patient(patient_id,status_filter="executada")
-    except httpx.HTTPError as e:
-        if debug:
-            print("Erro Feegow proposal/list:", e)
-
-    data: Dict[str, Any] = {
-        "paciente": {"id": patient_id, "nome": "Paciente Exemplo", "cpf": "—"},
-        "propostas": propostas,
-        "pagamentos": [
-        ],
-        "agendamentos": [
-        ],
-        "adicionais_sugeridos": [],
-    }
-
-    # >>> PAGAMENTOS: buscar todos os invoices do CPF (mais o invoice_id da URL, se vier) <<<
-    invoice_ids: list[str] = []
-    try:
-        invoice_ids.extend(list_invoice_ids_by_cpf(cpf_session))
-        if invoice_id:
-            iid = str(invoice_id)
-            if iid not in invoice_ids:
-                invoice_ids.append(iid)
-            try:
-                pagos = feegow.get_invoice_payments(
-                    invoice_id=invoice_id,
-                    data_start=pay_start,
-                    data_end=pay_end,
-                    tipo_transacao="C",
-                )
-                if debug:
-                    data.setdefault("_debug", {})["feegow_list_invoice"] = {
-                        "invoice_id": str(invoice_id),
-                        "params": {"data_start": pay_start, "data_end": pay_end, "tipo_transacao": "C"},
-                        "qtd": len(pagos or []),
-                    }
-                if isinstance(pagos, list) and pagos:
-                    pagos_dedup, removidos = dedupe_payments(pagos)
-                    data["pagamentos"] = pagos_dedup
-                    if debug and removidos:
-                        data.setdefault("_debug", {})["pagamentos_duplicados_removidos_single_invoice"] = removidos
-
-            except httpx.HTTPError as e:
-                if debug:
-                    data.setdefault("_debug", {})["pagamentos_error"] = {
-                        "error": str(e),
-                        "inspect": feegow.debug_list_invoice(
-                            invoice_id=invoice_id,
-                            data_start=pay_start,
-                            data_end=pay_end,
-                            tipo_transacao="C",
-                        ),
-                    }
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        audit_logger.info(f"WHATSAPP: status={r.status_code} body={r.text[:200]}")
     except Exception as e:
-        if debug:
-            data.setdefault("_debug", {})["invoice_query_error"] = str(e)
+        audit_logger.exception(f"WHATSAPP: erro ao enviar: {e}")
 
-    if invoice_ids:
-        try:
-            todos = []
-            for inv in invoice_ids:
+def save_gustavo_snapshot_and_send(session: Session, snapshot_day_sp: date) -> GustavoAgendaSnapshot:
+    """Gera e salva snapshot do dia (idempotente por snapshot_date)."""
+
+    existing = session.exec(
+        select(GustavoAgendaSnapshot).where(GustavoAgendaSnapshot.snapshot_date == snapshot_day_sp)
+    ).first()
+    if existing:
+        return existing
+
+    msg1, msg2, payload = build_gustavo_whatsapp_messages(session, snapshot_day_sp)
+
+    y0, m0 = snapshot_day_sp.year, snapshot_day_sp.month
+    y2, m2 = _add_months(y0, m0, 2)
+
+    snap = GustavoAgendaSnapshot(
+        snapshot_date=snapshot_day_sp,
+        generated_at=datetime.utcnow(),
+        period_start=_month_start(y0, m0),
+        period_end=_month_end(y2, m2),
+        message_1=msg1,
+        message_2=msg2,
+        payload=payload,
+    )
+
+    session.add(snap)
+    try:
+        session.commit()
+    except IntegrityError:
+        # idempotência em ambientes com +1 worker (Render/Uvicorn)
+        session.rollback()
+        existing = session.exec(
+            select(GustavoAgendaSnapshot).where(GustavoAgendaSnapshot.snapshot_date == snapshot_day_sp)
+        ).first()
+        if existing:
+            return existing
+        raise
+
+    session.refresh(snap)
+
+    # dispara WhatsApp usando o texto salvo
+    _whatsapp_send(msg1, msg2)
+
+    return snap
+
+def _next_run_19h_sp(now_sp: datetime) -> datetime:
+    run_today = now_sp.replace(hour=19, minute=0, second=0, microsecond=0)
+    if now_sp < run_today:
+        return run_today
+    return run_today + timedelta(days=1)
+
+def start_gustavo_snapshot_scheduler() -> None:
+    """
+    Scheduler simples (thread)
+    - roda diariamente às 19h (horário SP)
+    - fallback (Opção A): ao subir, se já passou de 19h e ainda não existe snapshot de hoje, gera imediatamente
+    """
+
+    def runner():
+        while True:
+            now_sp = datetime.now(TZ)
+            today_sp = now_sp.date()
+
+            # fallback: se já passou de 19h e não existe snapshot hoje, gera agora
+            if now_sp.hour >= 19:
+                with Session(engine) as session:
+                    exists = session.exec(
+                        select(GustavoAgendaSnapshot).where(GustavoAgendaSnapshot.snapshot_date == today_sp)
+                    ).first()
+                    if not exists:
+                        audit_logger.info(f"GUSTAVO_SNAPSHOT: fallback do dia {today_sp} (app subiu após 19h).")
+                        save_gustavo_snapshot_and_send(session, today_sp)
+
+            # dorme até o próximo 19h
+            nxt = _next_run_19h_sp(datetime.now(TZ))
+            seconds = max(5, int((nxt - datetime.now(TZ)).total_seconds()))
+            audit_logger.info(f"GUSTAVO_SNAPSHOT: próximo disparo em {nxt.isoformat()} (sleep {seconds}s).")
+            pytime.sleep(seconds)
+
+            # roda o snapshot do dia (19h)
+            run_day = datetime.now(TZ).date()
+            with Session(engine) as session:
                 try:
-                    pagos = feegow.get_invoice_payments(
-                        invoice_id=inv,
-                        data_start=pay_start,
-                        data_end=pay_end,
-                        tipo_transacao="C",
-                    )
-                    todos.extend(pagos or [])
-                except httpx.HTTPError as ee:
-                    if debug:
-                        data.setdefault("_debug", {}).setdefault("pagamentos_errors", {})[inv] = str(ee)
+                    audit_logger.info(f"GUSTAVO_SNAPSHOT: gerando snapshot do dia {run_day} (19h).")
+                    save_gustavo_snapshot_and_send(session, run_day)
+                except Exception as e:
+                    audit_logger.exception(f"GUSTAVO_SNAPSHOT: erro ao gerar/enviar: {e}")
 
-            # ordena por data e aplica (se nada vier, mantém stub)
-            if todos:
-                todos.sort(key=lambda x: x.get("data") or "")
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
 
-                # >>> NOVO: dedupe para evitar o mesmo pagamento em duas invoices
-                todos_dedup, removidos = dedupe_payments(todos)
-                data["pagamentos"] = todos_dedup
+def validate_mapa_block_rules(session: Session, day: date, surgeon_id: int) -> str | None:
+    # pega qualquer bloqueio que intersecte o dia
+    blocks = session.exec(
+        select(AgendaBlock).where(
+            AgendaBlock.start_date <= day,
+            AgendaBlock.end_date >= day,
+        )
+    ).all()
 
-                if debug and removidos:
-                    data.setdefault("_debug", {})["pagamentos_duplicados_removidos"] = removidos
+    if not blocks:
+        return None
 
-            # útil p/ conferir na UI durante dev
-            if debug:
-                data.setdefault("_debug", {})["invoice_ids_usados"] = invoice_ids
-        except Exception as e:
-            if debug:
-                data.setdefault("_debug", {})["pagamentos_error"] = str(e)
+    # se existir algum "applies_to_all" no dia, já bloqueia
+    for b in blocks:
+        if b.applies_to_all:
+            return f"Data bloqueada: {b.reason}"
 
-    # Nome real do paciente (se disponível)
-    try:
-        nome_real = feegow.get_patient_name_by_id(patient_id)
-        if nome_real:
-            data["paciente"]["nome"] = nome_real
-    except httpx.HTTPError:
-        pass
-    
-    # --- APLICA EXCEÇÕES DE PAGAMENTOS (se houver para este paciente) ---
-    raw_pagamentos = list(data.get("pagamentos") or [])
-    pagamentos_filtrados, ignores_aplicados = apply_payment_ignores(raw_pagamentos, patient_id)
-    data["pagamentos"] = pagamentos_filtrados
-    if debug:
-        data.setdefault("_debug", {})["exceptions_applied"] = ignores_aplicados
+    # caso contrário, bloqueia se o cirurgião estiver no grupo do bloqueio
+    block_ids = [b.id for b in blocks if b.id is not None]
+    if not block_ids:
+        return None
 
-    # Financeiro
-    total = sum(p.get("valor", 0) for p in propostas)
-    pago = sum(p.get("valor", 0) for p in data["pagamentos"])
-    saldo = max(total - pago, 0.0)
-    data["financeiro"] = {"total": total, "pago": pago, "saldo": saldo}
+    rel = session.exec(
+        select(AgendaBlockSurgeon).where(
+            AgendaBlockSurgeon.block_id.in_(block_ids),
+            AgendaBlockSurgeon.surgeon_id == surgeon_id,
+        )
+    ).first()
 
-    if debug:
-        data["_debug"] = {"qtd_propostas": len(propostas), "total_propostas": total}
-        dbg = data.setdefault("_debug", {})
-        dbg["qtd_propostas"] = len(propostas)
-        dbg["total_propostas"] = total
+    if rel:
+        return "Data bloqueada para este profissional."
 
-    # ======= AGENDAMENTOS (reais, janela curta por padrão) =======
-    # ======= AGENDAMENTOS (ano inteiro costurado em janelas <= 180d) =======
-    try:
-        start = date(2020, 1, 1)
-        end   = date(2030, 12, 31)
-        stitched = feegow.get_appointments_range_hydrated(patient_id, start, end)
-        data["agendamentos"] = stitched["items"]  # já vem com nomes traduzidos
-        if debug:
-            data.setdefault("_debug", {})["windows"] = stitched.get("windows", [])
-    except httpx.HTTPError:
-        data["agendamentos"] = []
+    return None
 
-    if debug:
-        data.setdefault("_debug", {})["qtd_agendamentos"] = len(data.get("agendamentos", []))
+def compute_month_availability(
+    session: Session,
+    surgeon_id: int,
+    month_ym: str,
+    procedure_type: str,
+) -> list[dict[str, str]]:
+    """
+    Retorna lista de datas operáveis no mês para o cirurgião + tipo de procedimento,
+    respeitando:
+      - validate_mapa_rules
+      - validate_mapa_block_rules
+      - reserva = agendamento
+    Mostra só 🔴 (livre) e 🟡 (parcial). Dias lotados NÃO retornam.
+    """
 
-    return data
+    selected_month, first_day, next_first, days = safe_selected_month(month_ym)
 
-@app.get("/me/summary")
-def my_summary(
-    cpf: str = Depends(current_user),
-    debug: int = Query(0),
-    invoice_id: Optional[str] = Query(None),
-    pay_start: str = Query("01-01-2000"),
-    pay_end:   str = Query("31-08-2050"),
+    surgeon = session.exec(select(User).where(User.id == surgeon_id)).first()
+    if not surgeon:
+        return []
+
+    results: list[dict[str, str]] = []
+
+    weekday_map = ["segunda-feira","terça-feira","quarta-feira","quinta-feira","sexta-feira","sábado","domingo"]
+
+    # Para o emoji 🟡 precisamos saber a capacidade do dia (no caso do Gustavo)
+    gustavo = session.exec(select(User).where(User.full_name == "Dr. Gustavo Aquino")).first()
+
+    for d in days:
+        # 1) bloqueios
+        block_err = validate_mapa_block_rules(session, d, surgeon_id)
+        if block_err:
+            continue
+
+        # 2) regras de agenda (usa o mesmo motor do create/edit)
+        err = validate_mapa_rules(
+            session=session,
+            day=d,
+            surgeon_id=surgeon_id,
+            procedure_type=procedure_type,
+            uses_hsr=False,   # consulta não define HSR; se quiser, adiciona no card depois
+            exclude_entry_id=None,
+        )
+        if err:
+            # inclui "dia fora do padrão" e "dia lotado" -> não aparece
+            continue
+
+        # 3) conta ocupações do cirurgião no dia (inclui reservas)
+        cnt = session.exec(
+            select(func.count()).select_from(SurgicalMapEntry).where(
+                SurgicalMapEntry.day == d,
+                SurgicalMapEntry.surgeon_id == surgeon_id,
+            )
+        ).one()
+
+        # 4) define capacidade do dia para o emoji (só Gustavo pode gerar 🟡 com cap=2)
+        cap = 1
+        if gustavo and surgeon_id == gustavo.id:
+            wd = d.weekday()
+            if procedure_type == "Refinamento" and wd == 4:
+                cap = 1
+            else:
+                cap = 2
+
+        # só 🔴 e 🟡 (dias lotados não chegam aqui, mas garantimos)
+        if cnt <= 0:
+            emoji = "🔴"
+        elif cnt < cap:
+            emoji = "🟡"
+        else:
+            continue  # lotado -> não aparece
+
+        results.append(
+            {
+                "day_iso": d.isoformat(),
+                "label": d.strftime("%d/%m"),
+                "human": f"{d.strftime('%d/%m/%Y')} - {weekday_map[d.weekday()]}",
+                "emoji": emoji,
+            }
+        )
+
+    return results
+
+def compute_priority_card(session: Session) -> dict:
+    today = datetime.now(TZ).date()
+    end = today + timedelta(days=90)  # janela “hoje até +90”
+
+    gustavo = session.exec(select(User).where(User.full_name == "Dr. Gustavo Aquino")).first()
+    if not gustavo:
+        return {"mode": "red", "items": []}
+
+    # 1) pega bloqueios que intersectam a janela
+    blocks = session.exec(
+        select(AgendaBlock).where(
+            AgendaBlock.start_date <= end,
+            AgendaBlock.end_date >= today,
+        )
+    ).all()
+
+    block_ids = [b.id for b in blocks if b.id is not None]
+
+    rels = []
+    if block_ids:
+        rels = session.exec(
+            select(AgendaBlockSurgeon).where(AgendaBlockSurgeon.block_id.in_(block_ids))
+        ).all()
+
+    surgeons_by_block: dict[int, list[int]] = {}
+    for r in rels:
+        surgeons_by_block.setdefault(r.block_id, []).append(r.surgeon_id)
+        
+    # ✅ precisamos do "surgeons" aqui dentro (escopo da função)
+    surgeons = session.exec(
+        select(User)
+        .where(User.role == "doctor", User.is_active == True)
+        .order_by(User.full_name)
+    ).all()
+
+    surgeons_name_by_id = {s.id: s.full_name for s in surgeons if s.id is not None}
+    block_surgeons_map: dict[int, list[str]] = {}
+
+    for b in blocks:
+        if not b.id:
+            continue
+        if b.applies_to_all:
+            block_surgeons_map[b.id] = ["Todos"]
+        else:
+            ids = surgeons_by_block.get(b.id, [])
+            names = [surgeons_name_by_id.get(sid) for sid in ids]
+            block_surgeons_map[b.id] = [n for n in names if n] or ["—"]
+
+    blocked_days: set[date] = set()
+
+    for b in blocks:
+        # bloqueio geral
+        if b.applies_to_all:
+            start = max(b.start_date, today)
+            finish = min(b.end_date, end)
+            d = start
+            while d <= finish:
+                blocked_days.add(d)
+                d += timedelta(days=1)
+            continue
+
+        # bloqueio por grupo: só conta se o Gustavo estiver no grupo
+        if gustavo and gustavo.id in surgeons_by_block.get(b.id or -1, []):
+            start = max(b.start_date, today)
+            finish = min(b.end_date, end)
+            d = start
+            while d <= finish:
+                blocked_days.add(d)
+                d += timedelta(days=1)
+
+    days = []
+    for i in range(0, 91):  # inclui a data final (ex.: 04/12 a 04/03)
+        d = today + timedelta(days=i)
+        if d.weekday() not in (0, 2):  # só segunda (0) e quarta (2)
+            continue
+        if d in blocked_days:
+            continue
+        days.append(d)
+
+    counts: dict[date, int] = {}
+    for d in session.exec(
+        select(SurgicalMapEntry.day).where(
+            SurgicalMapEntry.day >= today,
+            SurgicalMapEntry.day <= end,
+            SurgicalMapEntry.surgeon_id == gustavo.id,
+        )
+    ).all():
+        counts[d] = counts.get(d, 0) + 1
+
+    zeros = [d for d in days if counts.get(d, 0) == 0]
+    if zeros:
+        return {"mode": "red", "items": [f"🔴 {d.strftime('%d/%m/%Y')}" for d in zeros]}
+
+    ones = [d for d in days if counts.get(d, 0) == 1]
+    if ones:
+        return {
+            "mode": "yellow",
+            "items": [f"🟡 {_weekday_pt(d.weekday())} {d.strftime('%d/%m/%Y')}" for d in ones],
+        }
+
+    # se não tem zeros nem ones, então está tudo com 2+
+    return {"mode": "green", "items": []}
+
+def migrate_sqlite_schema(engine):
+    """
+    Migração idempotente do SQLite.
+    Ajusta a tabela agendablock (antiga) para o novo modelo:
+      - start_date / end_date
+      - reason
+      - applies_to_all
+    E cria a tabela de relação AgendaBlockSurgeon se não existir.
+    """
+
+    def _has_column(conn, table: str, col: str) -> bool:
+        rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == col for r in rows)  # r[1] = nome da coluna
+
+    def _add_column_if_missing(conn, table: str, col: str, col_type: str):
+        if not _has_column(conn, table, col):
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+    with engine.begin() as conn:
+        # Se a tabela ainda não existir, create_db_and_tables() vai criar.
+        # Aqui só migramos se ela existir.
+        tables = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='agendablock';"
+        ).fetchall()
+        if not tables:
+            return
+
+        # --- Novas colunas do modelo atual ---
+        _add_column_if_missing(conn, "agendablock", "start_date", "DATE")
+        _add_column_if_missing(conn, "agendablock", "end_date", "DATE")
+        _add_column_if_missing(conn, "agendablock", "reason", "TEXT")
+        _add_column_if_missing(conn, "agendablock", "applies_to_all", "INTEGER DEFAULT 0")
+
+        # --- Backfill a partir do schema antigo, se existir ---
+        # Antigo: data, motivo, profissional
+        has_old_date = _has_column(conn, "agendablock", "data")
+        has_old_reason = _has_column(conn, "agendablock", "motivo")
+        has_old_prof = _has_column(conn, "agendablock", "profissional")
+
+        if has_old_date:
+            conn.exec_driver_sql("""
+                UPDATE agendablock
+                   SET start_date = COALESCE(start_date, data),
+                       end_date   = COALESCE(end_date, data)
+                 WHERE data IS NOT NULL;
+            """)
+
+        if has_old_reason:
+            conn.exec_driver_sql("""
+                UPDATE agendablock
+                   SET reason = COALESCE(reason, motivo)
+                 WHERE motivo IS NOT NULL;
+            """)
+
+        if has_old_prof:
+            # Se profissional='todos' no schema antigo, vira applies_to_all=1
+            conn.exec_driver_sql("""
+                UPDATE agendablock
+                   SET applies_to_all = CASE
+                        WHEN applies_to_all IS NULL THEN
+                            CASE WHEN lower(profissional)='todos' THEN 1 ELSE 0 END
+                        ELSE applies_to_all
+                       END;
+            """)
+
+        # --- Criar tabela de relacionamento (multi-cirurgião) ---
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS agendablocksurgeon (
+                block_id INTEGER NOT NULL,
+                surgeon_id INTEGER NOT NULL,
+                PRIMARY KEY (block_id, surgeon_id)
+            );
+        """)
+
+def get_commercial_period(month_year: str) -> tuple[datetime, datetime]:
+    """
+    Retorna (start_datetime_utc_naive, end_datetime_utc_naive) do período comercial:
+    - padrão: dia 25 do mês anterior até dia 24 do mês selecionado
+    - exceção: Janeiro/2026 começa em 06/01/2026
+    """
+
+    tz = ZoneInfo("America/Sao_Paulo")
+    year, month = map(int, month_year.split("-"))
+
+    # início padrão: dia 25 do mês anterior (em horário SP)
+    if month == 1:
+        start_sp = datetime(year - 1, 12, 25, 0, 0, 0, tzinfo=tz)
+    else:
+        start_sp = datetime(year, month - 1, 25, 0, 0, 0, tzinfo=tz)
+
+    # fim padrão: dia 24 do mês atual (em horário SP)
+    end_sp = datetime(year, month, 24, 23, 59, 59, tzinfo=tz)
+
+    # 🚨 EXCEÇÃO: Janeiro/2026
+    if year == 2026 and month == 1:
+        start_sp = datetime(2026, 1, 6, 0, 0, 0, tzinfo=tz)
+
+    # Converte para UTC e remove tzinfo (para bater com created_at = utcnow() naive)
+    start_utc_naive = start_sp.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc_naive = end_sp.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return start_utc_naive, end_utc_naive
+
+@app.get("/comissoes")
+def comissoes_page(
+    request: Request,
+    month_year: str,
+    seller_id: str  | None = None,
+    session: Session = Depends(get_session),
 ):
-    pid, nome = feegow.get_patient_by_cpf(cpf)
-    if not pid:
-        raise HTTPException(status_code=404, detail="Paciente não encontrado")
+    """
+    Relatório de comissões por cirurgia agendada:
+    - procedure_type == "Cirurgia"
+    - não pode ser reserva (is_pre_reservation == False)
+    - período comercial (25->24, com exceção jan/2026 a partir de 06/01/2026)
+    - agrupado por vendedor (created_by_id)
+    """
 
-    # Reutiliza a função 'summary' existente, garantindo autorização via sessão
-    data = summary(
-        patient_id=pid,
-        debug=debug, invoice_id=invoice_id,
-        pay_start=pay_start, pay_end=pay_end,
-        cpf_session=cpf,   # <— passe o CPF da sessão aqui
-    )    # Ajuste de PII de forma controlada
-    try:
-        if isinstance(data, dict) and "paciente" in data and isinstance(data["paciente"], dict):
-            data["paciente"]["cpf"] = cpf
-            if nome:
-                data["paciente"]["nome"] = nome
-    except Exception:
-        pass
-    return data
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "comissao"))
 
-# ------------------------------------------------------------------
-# Rotas de depuração
-# ------------------------------------------------------------------
-@app.get("/_debug/config")
-def dbg_config():
-    token = os.getenv("FEEGOW_TOKEN", "")
+    period_start, period_end = get_commercial_period(month_year)
+    
+    seller_id_int: int | None = None
+    if seller_id and seller_id.strip():
+        try:
+            seller_id_int = int(seller_id)
+        except ValueError:
+            seller_id_int = None
+
+    # 1) Subquery: pega o primeiro agendamento (created_at mais antigo) por paciente
+    first_created_subq = (
+        select(
+            SurgicalMapEntry.patient_name,
+            func.min(SurgicalMapEntry.created_at).label("first_created_at"),
+        )
+        .where(
+            SurgicalMapEntry.procedure_type == "Cirurgia",
+            SurgicalMapEntry.is_pre_reservation == False,
+            SurgicalMapEntry.patient_name.is_not(None),
+            SurgicalMapEntry.patient_name != "",
+        )
+        .group_by(SurgicalMapEntry.patient_name)
+        .subquery()
+    )
+
+    # 2) Query principal: só traz as cirurgias que são o PRIMEIRO agendamento do paciente
+    q = (
+        select(SurgicalMapEntry)
+        .join(
+            first_created_subq,
+            (SurgicalMapEntry.patient_name == first_created_subq.c.patient_name)
+            & (SurgicalMapEntry.created_at == first_created_subq.c.first_created_at),
+        )
+        .where(
+            SurgicalMapEntry.created_at >= period_start,
+            SurgicalMapEntry.created_at <= period_end,
+        )
+    )
+
+    if seller_id_int is not None:
+        q = q.where(SurgicalMapEntry.created_by_id == seller_id_int)
+
+    entries = session.exec(q).all()
+
+    # mapa de usuários (para resolver nome do vendedor pelo created_by_id)
+    users = session.exec(select(User)).all()
+    users_by_id = {u.id: u for u in users}
+
+    # lista de vendedores para o filtro (somente quem pode “vender”)
+    sellers = [u for u in users if u.role in ("admin", "surgery") and u.is_active]
+
+    # Agrupamento por vendedor (nome vem do users_by_id)
+    grouped: dict[str, list[SurgicalMapEntry]] = {}
+
+    for e in entries:
+        seller_name = "Sem vendedor"
+        if e.created_by_id and e.created_by_id in users_by_id:
+            seller_name = users_by_id[e.created_by_id].full_name
+
+        grouped.setdefault(seller_name, []).append(e)
+
+    # Ordenar cirurgias dentro de cada vendedor (mais recentes primeiro)
+    for k in grouped:
+        grouped[k].sort(key=lambda x: x.created_at, reverse=True)
+
+    return templates.TemplateResponse(
+        "comissoes.html",
+        {
+            "request": request,
+            "current_user": user,
+            "month_year": month_year,
+            "period_start": period_start,
+            "period_end": period_end,
+            "grouped": grouped,
+            "total": len(entries),
+            "sellers": sellers,
+            "seller_id": seller_id,
+            "users_by_id": users_by_id,  # opcional (se quiser mostrar algo extra no template)
+        },
+    )
+
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+
+    # ✅ MIGRAÇÃO DO BANCO ANTIGO -> NOVO
+    migrate_sqlite_schema(engine)
+
+    with Session(engine) as session:
+        seed_if_empty(session)
+
+    # ✅ Snapshot diário (19h) - Relatório Dr. Gustavo
+    start_gustavo_snapshot_scheduler()
+
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request, session: Session = Depends(get_session)):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+
+    if user.role == "admin":
+        return redirect("/admin")
+    if user.role == "doctor":
+        return redirect("/doctor")
+    if user.role == "surgery":
+        return redirect("/mapa")
+    if user.role == "comissao":
+        # redireciona para o mês atual (você pode manter manual também)
+        today = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+        # regra do “mês comercial”: se hoje >= 25, isso pertence ao próximo month_year
+        if today.day >= 25:
+            y = today.year + (1 if today.month == 12 else 0)
+            m = 1 if today.month == 12 else today.month + 1
+        else:
+            y = today.year
+            m = today.month
+        month_year = f"{y:04d}-{m:02d}"
+        return redirect(f"/comissoes?month_year={month_year}")
+
+    return redirect("/login")
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    return templates.TemplateResponse(
+        "login.html", {"request": request, "current_user": None}
+    )
+
+
+@app.post("/login", response_class=HTMLResponse)
+def login_action(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    session: Session = Depends(get_session),
+):
+    user = session.exec(
+        select(User).where(User.username == username, User.is_active == True)
+    ).first()
+    if not user or not verify_password(password, user.password_hash):
+        audit_event(
+            request,
+            user,  # pode ser None (ok)
+            "login_failed",
+            success=False,
+            message="Usuário ou senha inválidos.",
+            extra={"username": username},
+        )
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Usuário ou senha inválidos.", "current_user": None},
+            status_code=401,
+        )
+    request.session["user_id"] = user.id
+    audit_event(request, user, "login_success")
+    return redirect("/")
+
+
+@app.post("/logout")
+def logout(request: Request, session: Session = Depends(get_session)):
+    user = get_current_user(request, session)
+    audit_event(request, user, "logout")
+    request.session.clear()
+    return redirect("/login")
+
+
+def availability_context(session: Session, day: date, role: str):
+    rooms = session.exec(select(Room).order_by(Room.id)).all()
+    slots = build_slots_for_day(day)
+
+    day_start = datetime.combine(day, time(0, 0))   # NAIVE p/ casar com o SQLite
+    day_end = day_start + timedelta(days=1)
+
+    reservations = session.exec(
+        select(Reservation).where(
+            Reservation.start_time >= day_start, Reservation.start_time < day_end
+        )
+    ).all()
+
+    pending_reqs = session.exec(
+        select(ReservationRequest).where(
+            ReservationRequest.status == "pending",
+            ReservationRequest.requested_start >= day_start,
+            ReservationRequest.requested_start < day_end,
+        )
+    ).all()
+
+    occupancy: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    
+    # Mapa de usuários por id (para mostrar o nome do médico nas reservas)
+    user_by_id = {u.id: u for u in session.exec(select(User)).all()}
+
+    for r in reservations:
+        for k in slot_keys(r.start_time):
+            occupancy.setdefault(r.room_id, {})[k] = {
+                "type": "reservation",
+                "doctor_name": user_by_id.get(r.doctor_id).full_name if user_by_id.get(r.doctor_id) else "Médico",
+            }
+
+    for rq in pending_reqs:
+        for k in slot_keys(rq.requested_start):
+            occupancy.setdefault(rq.room_id, {})[k] = {
+                "type": "request",
+                "doctor_name": user_by_id.get(rq.doctor_id).full_name if user_by_id.get(rq.doctor_id) else "Médico",
+            }
+
+    doctors = session.exec(
+        select(User)
+        .where(User.role == "doctor", User.is_active == True)
+        .order_by(User.full_name)
+    ).all()
+
+    weekday_map = [
+        "segunda-feira",
+        "terça-feira",
+        "quarta-feira",
+        "quinta-feira",
+        "sexta-feira",
+        "sábado",
+        "domingo",
+    ]
+    date_human = f"{day.strftime('%d/%m/%Y')} · {weekday_map[day.weekday()]}"
+
     return {
-        "base": os.getenv("FEEGOW_BASE"),
-        "auth_header": os.getenv("FEEGOW_AUTH_HEADER"),
-        "auth_scheme": os.getenv("FEEGOW_AUTH_SCHEME"),
-        "token_present": bool(token),
-        "token_len": len(token or ""),
+        "rooms": rooms,
+        "slots": slots,
+        "occupancy": occupancy,
+        "doctors": doctors,
+        "role": role,
+        "date_human": date_human,
     }
 
-@app.get("/_debug/feegow/appoints/{patient_id}")
-def dbg_appoints(
-    patient_id: int,
-    before: int = Query(90, ge=0, le=180),   # dias para trás
-    after:  int = Query(90, ge=0, le=180),   # dias para frente
+@app.get("/bloqueios", response_class=HTMLResponse)
+def bloqueios_page(
+    request: Request,
+    session: Session = Depends(get_session),
 ):
-    return feegow.debug_appoints(patient_id, days_before=before, days_after=after)
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"), "Acesso restrito.")
 
-@app.get("/_debug/feegow/appoints_range/{patient_id}")
-def dbg_appoints_range(
-    patient_id: int,
-    start: str = Query(..., description="Data inicial ISO: AAAA-MM-DD"),
-    end:   str = Query(..., description="Data final ISO: AAAA-MM-DD"),
-    hydrate: int = Query(1, description="1 = trazer nomes traduzidos"),
+    surgeons = session.exec(
+        select(User)
+        .where(User.role == "doctor", User.is_active == True)
+        .order_by(User.full_name)
+    ).all()
+
+    blocks = session.exec(
+        select(AgendaBlock).order_by(AgendaBlock.start_date.asc())
+    ).all()
+    
+        # ===== MAPA DE CIRURGIÕES POR BLOQUEIO =====
+    block_ids = [b.id for b in blocks if b.id is not None]
+
+    rels = []
+    if block_ids:
+        rels = session.exec(
+            select(AgendaBlockSurgeon).where(
+                AgendaBlockSurgeon.block_id.in_(block_ids)
+            )
+        ).all()
+
+    # block_id -> lista de nomes dos cirurgiões
+    block_surgeons_map: dict[int, list[str]] = {}
+
+    if rels:
+        surgeons_by_id = {s.id: s.full_name for s in surgeons}
+
+        for r in rels:
+            name = surgeons_by_id.get(r.surgeon_id)
+            if name:
+                block_surgeons_map.setdefault(r.block_id, []).append(name)
+
+
+    # ===== SUPORTE A EDIÇÃO DE BLOQUEIO =====
+    edit_block = None
+    selected_surgeons = []
+
+    edit_id = request.query_params.get("edit")
+    if edit_id and edit_id.isdigit():
+        edit_block = session.get(AgendaBlock, int(edit_id))
+
+        if edit_block and edit_block.id:
+            rels = session.exec(
+                select(AgendaBlockSurgeon).where(
+                    AgendaBlockSurgeon.block_id == edit_block.id
+                )
+            ).all()
+            selected_surgeons = [r.surgeon_id for r in rels]
+
+    return templates.TemplateResponse(
+        "bloqueios.html",
+        {
+            "request": request,
+            "current_user": user,
+            "surgeons": surgeons,
+            "blocks": blocks,
+            "edit_block": edit_block,
+            "selected_surgeons": selected_surgeons,
+            "block_surgeons_map": block_surgeons_map,
+        },
+    )
+    
+
+@app.post("/bloqueios")
+def registrar_bloqueio(
+    request: Request,
+    data_inicio: str = Form(...),
+    data_fim: str = Form(...),
+    motivo: str = Form(...),
+    surgeons: list[str] = Form([]),
+    session: Session = Depends(get_session),
 ):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"), "Acesso restrito.")
+
+    # converte "YYYY-MM-DD" para date
+    start_date = date.fromisoformat(data_inicio)
+    end_date = date.fromisoformat(data_fim)
+    
+    if end_date < start_date:
+        return redirect("/bloqueios")
+    
+    applies_all = (len(surgeons) == 0)
+
+    row = AgendaBlock(
+        day=start_date,
+        start_date=start_date,
+        end_date=end_date,
+        reason=motivo.strip(),
+        applies_to_all=applies_all,
+        created_by_id=user.id,
+    )
+    session.add(row)
+    session.commit()
+
+    if not applies_all:
+        for sid in surgeons:
+            session.add(AgendaBlockSurgeon(block_id=row.id, surgeon_id=int(sid)))
+        session.commit()
+
+    return redirect("/bloqueios")
+
+@app.post("/bloqueios/{block_id}/update")
+def bloqueio_update(
+    request: Request,
+    block_id: int,
+    data_inicio: str = Form(...),
+    data_fim: str = Form(...),
+    motivo: str = Form(...),
+    surgeons: list[str] = Form([]),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"), "Acesso restrito.")
+
+    b = session.get(AgendaBlock, block_id)
+    if not b:
+        return redirect("/bloqueios")
+
+    b.start_date = date.fromisoformat(data_inicio)
+    b.day = b.start_date
+    b.end_date = date.fromisoformat(data_fim)
+    if b.end_date < b.start_date:
+        return redirect("/bloqueios")
+    b.reason = motivo.strip()
+    b.applies_to_all = (len(surgeons) == 0)
+
+    session.add(b)
+    session.commit()
+
+    # limpa relações antigas
+    session.exec(
+        delete(AgendaBlockSurgeon).where(AgendaBlockSurgeon.block_id == block_id)
+    )
+    session.commit()
+
+    # recria relações
+    if not b.applies_to_all:
+        for sid in surgeons:
+            session.add(AgendaBlockSurgeon(block_id=block_id, surgeon_id=int(sid)))
+        session.commit()
+
+    return redirect("/bloqueios")
+
+@app.post("/bloqueios/{block_id}/delete")
+def bloqueio_delete(
+    request: Request,
+    block_id: int,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"), "Acesso restrito.")
+
+    # apaga relações
+    session.exec(
+        delete(AgendaBlockSurgeon).where(AgendaBlockSurgeon.block_id == block_id)
+    )
+    session.commit()
+
+    # apaga bloco
+    b = session.get(AgendaBlock, block_id)
+    if b:
+        session.delete(b)
+        session.commit()
+
+    return redirect("/bloqueios")
+
+@app.get("/doctor", response_class=HTMLResponse)
+def doctor_page(
+    request: Request,
+    date: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "doctor", "Acesso restrito aos médicos.")
+
+    selected, day = safe_selected_and_day(date)
+    ctx = availability_context(session, day, role="doctor")
+    audit_event(request, user, "doctor_page_view", extra={"date": selected})
+
+    return templates.TemplateResponse(
+        "doctor.html",
+        {
+            "request": request,
+            "current_user": user,
+            "title": "Agenda",
+            "selected_date": selected,
+            **ctx,
+        },
+    )
+
+@app.get("/doctor/availability", response_class=HTMLResponse)
+def doctor_availability(
+    request: Request,
+    date: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "doctor", "Acesso restrito aos médicos.")
+
+    _, day = safe_selected_and_day(date)
+    ctx = availability_context(session, day, role="doctor")
+
+    return templates.TemplateResponse(
+        "partials/availability.html",
+        {"request": request, "current_user": user, **ctx},
+    )
+
+
+@app.post("/doctor/request")
+def doctor_request(
+    request: Request,
+    room_id: int = Form(...),
+    start_iso: str = Form(...),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "doctor", "Acesso restrito aos médicos.")
+
+    start_dt = to_db_dt(datetime.fromisoformat(start_iso))
+    end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
+
+    existing_res = session.exec(
+        select(Reservation).where(
+            Reservation.room_id == room_id, Reservation.start_time == start_dt
+        )
+    ).first()
+    existing_req = session.exec(
+        select(ReservationRequest).where(
+            ReservationRequest.room_id == room_id,
+            ReservationRequest.requested_start == start_dt,
+            ReservationRequest.status == "pending",
+        )
+    ).first()
+    if existing_res or existing_req:
+        audit_event(
+            request,
+            user,
+            "request_conflict",
+            success=False,
+            message="Slot já ocupado (reserva ou solicitação pendente).",
+            room_id=room_id,
+            start_time=start_dt,
+            end_time=end_dt,
+        )
+        return redirect(f"/doctor?date={start_dt.date().isoformat()}")
+
+
+    rq = ReservationRequest(
+        room_id=room_id,
+        doctor_id=user.id,
+        requested_start=start_dt,
+        requested_end=end_dt,
+        status="pending",
+    )
+    session.add(rq)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        "request_created",
+        room_id=room_id,
+        target_type="request",
+        target_id=rq.id,
+        start_time=start_dt,
+        end_time=end_dt,
+    )
+
+    return redirect("/doctor")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(
+    request: Request,
+    date: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "admin", "Acesso restrito à secretaria/admin.")
+
+    selected, day = safe_selected_and_day(date)
+    ctx = availability_context(session, day, role="admin")
+
+    pending = session.exec(
+        select(ReservationRequest)
+        .where(ReservationRequest.status == "pending")
+        .order_by(ReservationRequest.created_at.desc())
+    ).all()
+
+    rooms = {r.id: r for r in session.exec(select(Room)).all()}
+    users = {u.id: u for u in session.exec(select(User)).all()}
+
+    pending_view = []
+    audit_event(request, user, "admin_page_view", extra={"date": selected})
+    for r in pending:
+        dt = r.requested_start.replace(tzinfo=TZ)
+        pending_view.append(
+            {
+                "id": r.id,
+                "doctor_name": users.get(r.doctor_id).full_name
+                if users.get(r.doctor_id)
+                else "Médico",
+                "room_name": rooms.get(r.room_id).name if rooms.get(r.room_id) else "Sala",
+                "date_str": dt.strftime("%d/%m/%Y"),
+                "time_str": dt.strftime("%H:%M"),
+            }
+        )
+
+    return templates.TemplateResponse(
+        "admin.html",
+        {
+            "request": request,
+            "current_user": user,
+            "title": "Agenda",
+            "selected_date": selected,
+            "pending_requests": pending_view,
+            **ctx,
+        },
+    )
+
+
+@app.get("/admin/availability", response_class=HTMLResponse)
+def admin_availability(
+    request: Request,
+    date: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "admin", "Acesso restrito à secretaria/admin.")
+
+    _, day = safe_selected_and_day(date)
+    ctx = availability_context(session, day, role="admin")
+
+    return templates.TemplateResponse(
+        "partials/availability.html",
+        {"request": request, "current_user": user, **ctx},
+    )
+
+
+@app.post("/admin/reserve")
+def admin_reserve(
+    request: Request,
+    room_id: int = Form(...),
+    doctor_id: int = Form(...),
+    start_iso: str = Form(...),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "admin", "Acesso restrito à secretaria/admin.")
+
+    start_dt = to_db_dt(datetime.fromisoformat(start_iso))
+    end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
+
+    existing = session.exec(
+        select(Reservation).where(
+            Reservation.room_id == room_id, Reservation.start_time == start_dt
+        )
+    ).first()
+    if existing:
+        audit_event(
+            request,
+            user,
+            "admin_reserve_conflict",
+            success=False,
+            message="Já existe reserva nesse horário.",
+            room_id=room_id,
+            start_time=start_dt,
+            end_time=end_dt,
+            extra={"doctor_id": doctor_id},
+        )
+        return redirect(f"/admin?date={start_dt.date().isoformat()}")
+
+
+    res = Reservation(
+        room_id=room_id,
+        doctor_id=doctor_id,
+        created_by_id=user.id,
+        start_time=start_dt,
+        end_time=end_dt,
+    )
+    session.add(res)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        "admin_reserve_created",
+        room_id=room_id,
+        target_type="reservation",
+        target_id=res.id,
+        start_time=start_dt,
+        end_time=end_dt,
+        extra={"doctor_id": doctor_id},
+    )
+
+    return redirect("/admin")
+
+
+@app.post("/admin/requests/{request_id}/approve")
+def approve_request(request: Request, request_id: int, session: Session = Depends(get_session)):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "admin")
+
+    rq = session.get(ReservationRequest, request_id)
+    if not rq or rq.status != "pending":
+        return redirect("/admin")
+
+    existing = session.exec(
+        select(Reservation).where(
+            Reservation.room_id == rq.room_id,
+            Reservation.start_time == rq.requested_start,
+        )
+    ).first()
+
+    if existing:
+        rq.status = "denied"
+        rq.decided_by_id = user.id
+        rq.decided_at = datetime.utcnow()
+        session.add(rq)
+        session.commit()
+        audit_event(
+            request,
+            user,
+            "request_approve_conflict_denied",
+            success=False,
+            message="Havia reserva no slot; solicitação negada automaticamente.",
+            room_id=rq.room_id,
+            target_type="request",
+            target_id=rq.id,
+            start_time=rq.requested_start,
+            end_time=rq.requested_end,
+        )
+        return redirect("/admin")
+
+    res = Reservation(
+        room_id=rq.room_id,
+        doctor_id=rq.doctor_id,
+        created_by_id=user.id,
+        start_time=rq.requested_start,
+        end_time=rq.requested_end,
+    )
+    session.add(res)
+
+    rq.status = "approved"
+    rq.decided_by_id = user.id
+    rq.decided_at = datetime.utcnow()
+    session.add(rq)
+
+    session.commit()
+    audit_event(
+        request,
+        user,
+        "request_approved",
+        room_id=rq.room_id,
+        target_type="request",
+        target_id=rq.id,
+        start_time=rq.requested_start,
+        end_time=rq.requested_end,
+        extra={"reservation_id": res.id},
+    )
+
+    return redirect("/admin")
+
+
+@app.post("/admin/requests/{request_id}/deny")
+def deny_request(request: Request, request_id: int, session: Session = Depends(get_session)):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role == "admin")
+
+    rq = session.get(ReservationRequest, request_id)
+    if rq and rq.status == "pending":
+        rq.status = "denied"
+        rq.decided_by_id = user.id
+        rq.decided_at = datetime.utcnow()
+        session.add(rq)
+        session.commit()
+        audit_event(
+            request,
+            user,
+            "request_denied",
+            room_id=rq.room_id,
+            target_type="request",
+            target_id=rq.id,
+            start_time=rq.requested_start,
+            end_time=rq.requested_end,
+        )
+
+    return redirect("/admin")
+
+@app.get("/mapa", response_class=HTMLResponse)
+def mapa_page(
+    request: Request,
+    month: Optional[str] = None,
+    err: str | None = None,
+    av_do: Optional[str] = None,
+    av_surgeon_id: Optional[int] = None,
+    av_month: Optional[str] = None,
+    av_procedure_type: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"), "Acesso restrito ao Mapa Cirúrgico.")
+
+    selected_month, first_day, next_first, days = safe_selected_month(month)
+
+    audit_event(
+        request,
+        user,
+        "mapa_page_view",
+        extra={"month": selected_month},
+    )
+    surgeons = session.exec(
+        select(User)
+        .where(User.role == "doctor", User.is_active == True)
+        .order_by(User.full_name)
+    ).all()
+    
+    sellers = session.exec(
+        select(User).where(User.role == "surgery", User.is_active == True).order_by(User.full_name)
+    ).all()
+    
+    users_all = session.exec(select(User)).all()
+    users_by_id = {u.id: u for u in users_all if u.id is not None}
+
+    entries = session.exec(
+        select(SurgicalMapEntry)
+        .where(SurgicalMapEntry.day >= first_day, SurgicalMapEntry.day < next_first)
+        .order_by(SurgicalMapEntry.day, SurgicalMapEntry.time_hhmm, SurgicalMapEntry.created_at)
+    ).all()
+
+    entries_by_day: dict[str, list[SurgicalMapEntry]] = {}
+    for e in entries:
+        entries_by_day.setdefault(e.day.isoformat(), []).append(e)
+
+    # pega bloqueios que intersectam o mês
+    blocks = session.exec(
+        select(AgendaBlock)
+        .where(
+            AgendaBlock.start_date <= (next_first - timedelta(days=1)),
+            AgendaBlock.end_date >= first_day,
+        )
+        .order_by(AgendaBlock.start_date, AgendaBlock.created_at)
+    ).all()
+
+    # relações (multi-cirurgiões)
+    block_ids = [b.id for b in blocks if b.id is not None]
+    rels = []
+    if block_ids:
+        rels = session.exec(
+            select(AgendaBlockSurgeon).where(AgendaBlockSurgeon.block_id.in_(block_ids))
+        ).all()
+
+    surgeons_by_block: dict[int, list[int]] = {}
+    for r in rels:
+        surgeons_by_block.setdefault(r.block_id, []).append(r.surgeon_id)
+    
+    # ✅ block_id -> lista de nomes dos cirurgiões (para exibir no mapa.html)
+    surgeons_by_id = {s.id: s.full_name for s in surgeons if s.id is not None}
+    block_surgeons_map: dict[int, list[str]] = {}
+
+    for b in blocks:
+        if not b.id:
+            continue
+        if b.applies_to_all:
+            block_surgeons_map[b.id] = ["Todos"]
+        else:
+            ids = surgeons_by_block.get(b.id, [])
+            names = [surgeons_by_id.get(sid) for sid in ids]
+            block_surgeons_map[b.id] = [n for n in names if n] or ["—"]
+
+    blocks_by_day: dict[str, list[AgendaBlock]] = {}
+    blocked_all_days: set[str] = set()
+    blocked_surgeons_by_day: dict[str, list[int]] = {}
+
+    # expande cada bloqueio para os dias do mês (no máximo 31 dias)
+    month_end = next_first - timedelta(days=1)
+
+    for b in blocks:
+        start = max(b.start_date, first_day)
+        end = min(b.end_date, month_end)
+
+        d = start
+        while d <= end:
+            k = d.isoformat()
+            blocks_by_day.setdefault(k, []).append(b)
+
+            if b.applies_to_all:
+                blocked_all_days.add(k)
+            else:
+                ids = surgeons_by_block.get(b.id or -1, [])
+                if ids:
+                    blocked_surgeons_by_day.setdefault(k, []).extend(ids)
+
+            d += timedelta(days=1)
+
+    priority = compute_priority_card(session)
+
+    weekday_map = ["segunda-feira","terça-feira","quarta-feira","quinta-feira","sexta-feira","sábado","domingo"]
+
+    # =========================
+    # Consulta de Disponibilidade (card)
+    # =========================
+    av_results: list[dict[str, str]] = []
+    av_selected_month = av_month or selected_month
+    av_selected_surgeon_id = av_surgeon_id
+    av_selected_procedure_type = av_procedure_type or "Cirurgia"
+
+    if av_do == "1" and av_selected_surgeon_id:
+        av_results = compute_month_availability(
+            session=session,
+            surgeon_id=int(av_selected_surgeon_id),
+            month_ym=av_selected_month,
+            procedure_type=av_selected_procedure_type,
+        )
+    
+    return templates.TemplateResponse(
+        "mapa.html",
+        {
+            "request": request,
+            "current_user": user,
+            "fmt_brasilia": fmt_brasilia,
+            "err": err,
+            "title": "Mapa Cirúrgico",
+            "selected_month": selected_month,   # YYYY-MM
+            "days": days,
+            "entries_by_day": entries_by_day,   # dict[str, list]
+            "surgeons": surgeons,
+            "weekday_map": weekday_map,
+            "users_by_id": users_by_id,
+            "blocks": blocks,
+            "blocks_by_day": blocks_by_day,
+            "block_surgeons_map": block_surgeons_map,  # ✅ NOVO
+            "blocked_all_days": blocked_all_days,
+            "blocked_surgeons_by_day": blocked_surgeons_by_day,
+            "priority_mode": priority["mode"],
+            "priority_items": priority["items"],
+            "sellers": sellers,
+            "blocked_all_days": blocked_all_days,  # set[str] -> "2026-01-15"
+            "blocked_surgeons_by_day": blocked_surgeons_by_day,  # dict[str, list[int]]
+            "av_selected_month": av_selected_month,
+            "av_selected_surgeon_id": av_selected_surgeon_id,
+            "av_selected_procedure_type": av_selected_procedure_type,
+            "av_results": av_results,
+        },
+    )
+
+
+@app.post("/mapa/create")
+def mapa_create(
+    request: Request,
+    day_iso: str = Form(...),
+    mode: str = Form("book"),
+    time_hhmm: Optional[str] = Form(None),
+    patient_name: str = Form(...),
+    surgeon_id: int = Form(...),
+    procedure_type: str = Form(...),
+    location: str = Form(...),
+    uses_hsr: Optional[str] = Form(None),
+    seller_id: Optional[int] = Form(None),
+    force_override: Optional[str] = Form(None),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+    
+    is_johnny = (user.username == "johnny.ge")
+    override = is_johnny and bool(force_override)
+
+    # ✅ regra do vendedor (depois do user existir!)
+    if user.username != "johnny.ge":
+        seller_id_final = user.id
+    else:
+        seller_id_final = int(seller_id) if seller_id else user.id
+
+    day = date.fromisoformat(day_iso)
+    
+    is_pre = (mode == "reserve")
+
+    block_err = validate_mapa_block_rules(session, day, surgeon_id)
+    if block_err and not override:
+        month = day.strftime("%Y-%m")
+        from urllib.parse import quote
+        audit_event(request, user, "surgical_map_blocked_by_agenda_block", success=False, message=block_err)
+
+        return redirect(
+            f"/mapa?month={month}&open=1"
+            f"&err={quote(block_err)}"
+            f"&day_iso={quote(day_iso)}"
+            f"&mode={quote(mode)}"
+            f"&time_hhmm={quote(time_hhmm or '')}"
+            f"&patient_name={quote(patient_name)}"
+            f"&surgeon_id={surgeon_id}"
+            f"&procedure_type={quote(procedure_type)}"
+            f"&location={quote(location)}"
+            f"&uses_hsr={1 if uses_hsr else 0}"
+            f"&seller_id={seller_id_final}"
+        )
+
+    # se passou com override, registra auditoria
+    if block_err and override:
+        audit_event(request, user, "surgical_map_override_agenda_block", success=True, message=block_err)
+
+    err = validate_mapa_rules(session, day, surgeon_id, procedure_type, uses_hsr=bool(uses_hsr))
+    if err and not override:
+        month = day.strftime("%Y-%m")
+        audit_event(
+            request,
+            user,
+            "surgical_map_create_validation_error",
+            success=False,
+            message=err,
+            extra={
+                "day": day_iso,
+                "time_hhmm": time_hhmm,
+                "patient_name": patient_name,
+                "surgeon_id": surgeon_id,
+                "procedure_type": procedure_type,
+                "location": location,
+                "uses_hsr": bool(uses_hsr),
+                "mode": mode,
+            },
+        )
+        from urllib.parse import quote
+        return redirect(
+            f"/mapa?month={month}&open=1"
+            f"&err={quote(err)}"
+            f"&day_iso={quote(day_iso)}"
+            f"&mode={quote(mode)}"
+            f"&time_hhmm={quote(time_hhmm or '')}"
+            f"&patient_name={quote(patient_name)}"
+            f"&surgeon_id={surgeon_id}"
+            f"&procedure_type={quote(procedure_type)}"
+            f"&location={quote(location)}"
+            f"&uses_hsr={1 if uses_hsr else 0}"
+            f"&seller_id={seller_id_final}"
+        )
+    
+    time_hhmm = (time_hhmm or "").strip()  # normaliza
+    
+    row = SurgicalMapEntry(
+        day=day,
+        time_hhmm=(time_hhmm or None),
+        patient_name=patient_name.strip().upper(),
+        surgeon_id=surgeon_id,
+        procedure_type=procedure_type,
+        location=location,
+        uses_hsr=bool(uses_hsr),
+        is_pre_reservation=is_pre,
+        created_by_id=seller_id_final,
+    )
+    
+    session.add(row)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        "surgical_map_created",
+        target_type="surgical_map",
+        target_id=row.id,
+        extra={
+            "day": day_iso,
+            "patient_name": patient_name,
+            "surgeon_id": surgeon_id,
+            "procedure_type": procedure_type,
+            "location": location,
+            "uses_hsr": bool(uses_hsr),
+        },
+    )
+
+    month = day.strftime("%Y-%m")
+    return redirect(f"/mapa?month={month}")
+
+@app.post("/mapa/update/{entry_id}")
+def mapa_update(
+    request: Request,
+    entry_id: int,
+    day_iso: str = Form(...),
+    mode: str = Form("book"),
+    time_hhmm: Optional[str] = Form(None),
+    patient_name: str = Form(...),
+    surgeon_id: int = Form(...),
+    procedure_type: str = Form(...),
+    location: str = Form(...),
+    uses_hsr: Optional[str] = Form(None),
+    seller_id: Optional[int] = Form(None),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+    
+    is_johnny = (user.username == "johnny.ge")
+    override = is_johnny and bool(force_override)
+    
+    # ✅ regra do vendedor (mesma do /mapa/create)
+    if user.username != "johnny.ge":
+        seller_id_final = user.id
+    else:
+        seller_id_final = int(seller_id) if seller_id else user.id
+
+    row = session.get(SurgicalMapEntry, entry_id)
+    if not row:
+        return redirect("/mapa")
+
+    day = date.fromisoformat(day_iso)
+    is_pre = (mode == "reserve")
+
+    # valida regras EXCLUINDO o próprio item (pra não bloquear edição à toa)
+    err = validate_mapa_rules(
+        session,
+        day,
+        surgeon_id,
+        procedure_type,
+        uses_hsr=bool(uses_hsr),
+        exclude_entry_id=entry_id,
+    )
+    if err:
+        month = day.strftime("%Y-%m")
+        from urllib.parse import quote
+        return redirect(
+            f"/mapa?month={month}&open=1&edit_id={entry_id}"
+            f"&err={quote(err)}"
+            f"&day_iso={quote(day_iso)}"
+            f"&mode={quote(mode)}"
+            f"&time_hhmm={quote(time_hhmm or '')}"
+            f"&patient_name={quote(patient_name)}"
+            f"&surgeon_id={surgeon_id}"
+            f"&procedure_type={quote(procedure_type)}"
+            f"&location={quote(location)}"
+            f"&uses_hsr={1 if uses_hsr else 0}"
+        )
+
+    # snapshot (opcional) pra auditoria
+    before = {
+        "day": row.day.isoformat(),
+        "time_hhmm": row.time_hhmm,
+        "patient_name": row.patient_name,
+        "surgeon_id": row.surgeon_id,
+        "procedure_type": row.procedure_type,
+        "location": row.location,
+        "uses_hsr": row.uses_hsr,
+        "is_pre_reservation": row.is_pre_reservation,
+    }
+
+    time_hhmm = (time_hhmm or "").strip()  # normaliza
+
+    # aplica alterações
+    row.day = day
+    row.time_hhmm = time_hhmm or None
+    row.patient_name = patient_name.strip().upper()
+    row.surgeon_id = surgeon_id
+    row.procedure_type = procedure_type
+    row.location = location
+    row.uses_hsr = bool(uses_hsr)
+    row.is_pre_reservation = is_pre
+    row.created_by_id = seller_id_final 
+
+    session.add(row)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        "surgical_map_updated",
+        target_type="surgical_map",
+        target_id=row.id,
+        extra={
+            "before": before,
+            "after": {
+                "day": row.day.isoformat(),
+                "time_hhmm": row.time_hhmm,
+                "patient_name": row.patient_name,
+                "surgeon_id": row.surgeon_id,
+                "procedure_type": row.procedure_type,
+                "location": row.location,
+                "uses_hsr": row.uses_hsr,
+                "is_pre_reservation": row.is_pre_reservation,
+            },
+        },
+    )
+
+    month = day.strftime("%Y-%m")
+    return redirect(f"/mapa?month={month}")
+
+    if err and override:
+        audit_event(request, user, "surgical_map_override_rule", success=True, message=err)
+
+@app.post("/mapa/delete/{entry_id}")
+def mapa_delete(
+    request: Request,
+    entry_id: int,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+
+    row = session.get(SurgicalMapEntry, entry_id)
+    if row:
+        month = row.day.strftime("%Y-%m")
+        session.delete(row)
+        session.commit()
+
+        audit_event(
+            request,
+            user,
+            "surgical_map_deleted",
+            target_type="surgical_map",
+            target_id=entry_id,
+            extra={
+                "day": row.day.isoformat(),
+                "time_hhmm": row.time_hhmm,
+                "patient_name": row.patient_name,
+                "surgeon_id": row.surgeon_id,
+                "procedure_type": row.procedure_type,
+                "location": row.location,
+                "uses_hsr": row.uses_hsr,
+                "is_pre_reservation": getattr(row, "is_pre_reservation", None),
+            },
+        )
+        return redirect(f"/mapa?month={month}")
+
+    audit_event(
+        request,
+        user,
+        "surgical_map_delete_not_found",
+        success=False,
+        message="Tentou apagar um agendamento que não existe (ou já foi removido).",
+        target_type="surgical_map",
+        target_id=entry_id,
+    )
+    return redirect("/mapa")
+
+@app.get("/relatorio_gustavo", response_class=HTMLResponse)
+def relatorio_gustavo_page(
+    request: Request,
+    snapshot_date: str = "",
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.username == "johnny.ge")
+
+    snaps = session.exec(
+        select(GustavoAgendaSnapshot).order_by(GustavoAgendaSnapshot.snapshot_date.desc())
+    ).all()
+    available_dates = [s.snapshot_date.isoformat() for s in snaps]
+
+    selected = None
+    if snapshot_date:
+        try:
+            y, m, d = map(int, snapshot_date.split("-"))
+            sel = date(y, m, d)
+            selected = session.exec(
+                select(GustavoAgendaSnapshot).where(GustavoAgendaSnapshot.snapshot_date == sel)
+            ).first()
+        except Exception:
+            selected = None
+
+    return templates.TemplateResponse(
+        "relatorio_gustavo.html",
+        {
+            "request": request,
+            "current_user": user,
+            "available_dates": available_dates,
+            "snapshot": selected,
+            "snapshot_date": snapshot_date or "",
+        },
+    )
+@app.post("/relatorio_gustavo/run-now")
+def relatorio_gustavo_run_now(
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+
+    # Somente admin ou surgery podem gerar manualmente
+    require(user.username == "johnny.ge")
+
+    # Data de hoje no fuso de SP
+    now_sp = datetime.now(TZ)
+    today_sp = now_sp.date()
+
+    audit_logger.info(
+        f"GUSTAVO_SNAPSHOT: geração manual solicitada por {user.username} em {today_sp}"
+    )
+
     try:
-        d_start = datetime.strptime(start, "%Y-%m-%d").date()
-        d_end   = datetime.strptime(end,   "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Datas devem estar no formato AAAA-MM-DD")
+        save_gustavo_snapshot_and_send(session, today_sp)
+    except Exception as e:
+        audit_logger.exception("Erro ao gerar snapshot manualmente")
+        raise HTTPException(status_code=500, detail="Erro ao gerar snapshot")
 
-    if hydrate:
-        return feegow.get_appointments_range_hydrated(patient_id, d_start, d_end)
-    return feegow.get_appointments_range(patient_id, d_start, d_end)
+    # Volta para a tela já selecionando a data gerada
+    return redirect(f"/relatorio_gustavo?snapshot_date={today_sp.isoformat()}")
 
-@app.get("/debug/feegow/list-invoice")
-def _debug_list_invoice(invoice_id: str,
-                        data_start: str = "01-01-2000",
-                        data_end: str   = "31-08-2050",
-                        tipo_transacao: str = "C"):
-    return feegow.debug_list_invoice(invoice_id, data_start, data_end, tipo_transacao)
+# ============================================================
+# HOSPEDAGEM
+# ============================================================
+
+@app.get("/hospedagem", response_class=HTMLResponse)
+def hospedagem_page(
+    request: Request,
+    month: Optional[str] = None,
+    err: Optional[str] = None,
+    open: Optional[str] = None,
+    unit: Optional[str] = None,
+    check_in: Optional[str] = None,
+    check_out: Optional[str] = None,
+    patient_name: Optional[str] = None,
+    is_pre_reservation: Optional[str] = None,
+    edit_id: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+
+    selected_month = safe_selected_month(month)
+
+    y, m = map(int, selected_month.split("-"))
+    first_day = date(y, m, 1)
+    _, last_day = calendar.monthrange(y, m)
+    next_month_first = (date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1))
+
+    days = [date(y, m, d) for d in range(1, last_day + 1)]
+    day_index = {d: i for i, d in enumerate(days)}
+
+    units = ["suite_1", "suite_2", "apto"]
+
+    # busca reservas que encostam no mês (por período)
+    q = select(LodgingReservation).where(
+        LodgingReservation.check_in < next_month_first,
+        LodgingReservation.check_out > first_day,
+    )
+    reservations = session.exec(q).all()
+
+    # barras por unidade (grid com colunas = dias)
+    bars_by_unit: dict[str, list[dict]] = {u: [] for u in units}
+
+    for r in reservations:
+        u = r.unit or ""
+        if u not in bars_by_unit:
+            continue
+
+        # clamp dentro do mês visível
+        start = max(r.check_in, first_day)
+        end = min(r.check_out, next_month_first)
+
+        if start >= end:
+            continue
+
+        start_col = day_index[start] + 1
+        end_col = day_index[end - timedelta(days=1)] + 2  # fim exclusivo
+
+        bars_by_unit[u].append(
+            {
+                "id": r.id,
+                "patient_name": r.patient_name,
+                "check_in": r.check_in.strftime("%d/%m/%Y"),
+                "check_out": r.check_out.strftime("%d/%m/%Y"),
+                "start_col": start_col,
+                "end_col": end_col,
+                "is_pre": 1 if r.is_pre_reservation else 0,
+            }
+        )
+
+    # ordena barras na linha
+    for u in bars_by_unit:
+        bars_by_unit[u].sort(key=lambda b: (b["start_col"], b["end_col"]))
+
+    return templates.TemplateResponse(
+        "hospedagem.html",
+        {
+            "request": request,
+            "current_user": user,
+            "selected_month": selected_month,
+            "days": days,
+            "units": units,
+            "bars_by_unit": bars_by_unit,
+            "human_unit": human_unit,
+            "err": err or "",
+            "open": open or "",
+            "unit_prefill": unit or "",
+            "check_in_prefill": check_in or "",
+            "check_out_prefill": check_out or "",
+            "patient_prefill": patient_name or "",
+            "pre_prefill": 1 if (is_pre_reservation == "1") else 0,
+            "edit_id": edit_id or "",
+        },
+    )
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.post("/hospedagem/create")
+def hospedagem_create(
+    request: Request,
+    unit: str = Form(...),
+    patient_name: str = Form(...),
+    check_in: str = Form(...),
+    check_out: str = Form(...),
+    is_pre_reservation: Optional[str] = Form(None),
+    note: Optional[str] = Form(None),
+    surgery_entry_id: Optional[int] = Form(None),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
 
+    selected_month = safe_selected_month(None)
+
+    try:
+        ci = date.fromisoformat(check_in)
+        co = date.fromisoformat(check_out)
+    except Exception:
+        return redirect(f"/hospedagem?err={quote('Datas inválidas.')}&open=1")
+
+    e = validate_lodging_period(ci, co)
+    if e:
+        return redirect(f"/hospedagem?err={quote(e)}&open=1")
+
+    e = validate_lodging_conflict(session, unit, ci, co)
+    if e:
+        return redirect(
+            f"/hospedagem?err={quote(e)}&open=1"
+            f"&unit={quote(unit)}&check_in={quote(check_in)}&check_out={quote(check_out)}"
+            f"&patient_name={quote(patient_name)}&is_pre_reservation={(1 if is_pre_reservation else 0)}"
+        )
+
+    row = LodgingReservation(
+        unit=unit,
+        patient_name=patient_name.strip().upper(),
+        check_in=ci,
+        check_out=co,
+        is_pre_reservation=bool(is_pre_reservation),
+        note=(note or None),
+        created_by_id=user.id,
+        updated_by_id=user.id,
+        surgery_entry_id=surgery_entry_id,
+    )
+    session.add(row)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        action="lodging_create",
+        success=True,
+        message=None,
+        target_type="lodging",
+        target_id=row.id,
+    )
+
+    month_param = f"{ci.year:04d}-{ci.month:02d}"
+    return redirect(f"/hospedagem?month={month_param}")
+
+
+@app.post("/hospedagem/update/{res_id}")
+def hospedagem_update(
+    request: Request,
+    res_id: int,
+    unit: str = Form(...),
+    patient_name: str = Form(...),
+    check_in: str = Form(...),
+    check_out: str = Form(...),
+    is_pre_reservation: Optional[str] = Form(None),
+    note: Optional[str] = Form(None),
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+
+    row = session.get(LodgingReservation, res_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Reserva não encontrada")
+
+    try:
+        ci = date.fromisoformat(check_in)
+        co = date.fromisoformat(check_out)
+    except Exception:
+        return redirect(f"/hospedagem?err={quote('Datas inválidas.')}&open=1")
+
+    e = validate_lodging_period(ci, co)
+    if e:
+        return redirect(f"/hospedagem?err={quote(e)}&open=1&edit_id={res_id}")
+
+    e = validate_lodging_conflict(session, unit, ci, co, exclude_id=res_id)
+    if e:
+        return redirect(f"/hospedagem?err={quote(e)}&open=1&edit_id={res_id}")
+
+    row.unit = unit
+    row.patient_name = patient_name.strip().upper()
+    row.check_in = ci
+    row.check_out = co
+    row.is_pre_reservation = bool(is_pre_reservation)
+    row.note = (note or None)
+    row.updated_by_id = user.id
+    row.updated_at = datetime.utcnow()
+
+    session.add(row)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        action="lodging_update",
+        success=True,
+        message=None,
+        target_type="lodging",
+        target_id=row.id,
+    )
+
+    month_param = f"{ci.year:04d}-{ci.month:02d}"
+    return redirect(f"/hospedagem?month={month_param}")
+
+
+@app.post("/hospedagem/delete/{res_id}")
+def hospedagem_delete(
+    request: Request,
+    res_id: int,
+    session: Session = Depends(get_session),
+):
+    user = get_current_user(request, session)
+    if not user:
+        return redirect("/login")
+    require(user.role in ("admin", "surgery"))
+
+    row = session.get(LodgingReservation, res_id)
+    if not row:
+        return redirect("/hospedagem")
+
+    month_param = f"{row.check_in.year:04d}-{row.check_in.month:02d}"
+
+    session.delete(row)
+    session.commit()
+
+    audit_event(
+        request,
+        user,
+        action="lodging_delete",
+        success=True,
+        message=None,
+        target_type="lodging",
+        target_id=res_id,
+    )
+    return redirect(f"/hospedagem?month={month_param}")
