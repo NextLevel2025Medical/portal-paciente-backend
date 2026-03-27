@@ -71,7 +71,13 @@ class PaymentIgnore(SQLModel, table=True):
     valor: Optional[float] = None        
     forma: Optional[str] = None          
     occurrences: int = 1                 
-    note: Optional[str] = None           
+    note: Optional[str] = None          
+    
+class ProposalVisibility(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    cpf: str = Field(index=True)
+    proposal_id: str = Field(index=True)
+    visible: bool = Field(default=True) 
 
 def list_invoice_ids_by_cpf(cpf: str) -> list[str]:
     """
@@ -222,6 +228,66 @@ def dedupe_payments(pagamentos: list[dict]) -> tuple[list[dict], list[dict]]:
         out.append(p)
 
     return out, removed
+
+def get_visible_proposal_ids(cpf: str) -> set[str]:
+    cpf_num = re.sub(r"\D+", "", cpf or "")
+    if not cpf_num:
+        return set()
+
+    with Session(engine) as s:
+        rows = s.exec(
+            select(ProposalVisibility).where(
+                ProposalVisibility.cpf == cpf_num,
+                ProposalVisibility.visible == True
+            )
+        ).all()
+
+    return {
+        str(r.proposal_id).strip()
+        for r in rows
+        if getattr(r, "proposal_id", None) is not None
+    }
+
+
+def has_visibility_config(cpf: str) -> bool:
+    cpf_num = re.sub(r"\D+", "", cpf or "")
+    if not cpf_num:
+        return False
+
+    with Session(engine) as s:
+        row = s.exec(
+            select(ProposalVisibility.id).where(ProposalVisibility.cpf == cpf_num)
+        ).first()
+
+    return bool(row)
+
+
+def save_visible_proposals(cpf: str, proposal_ids: list[str]) -> list[str]:
+    cpf_num = re.sub(r"\D+", "", cpf or "")
+    normalized = []
+    seen = set()
+
+    for pid in proposal_ids or []:
+        v = str(pid or "").strip()
+        if not v or v in seen:
+            continue
+        normalized.append(v)
+        seen.add(v)
+
+    with Session(engine) as s:
+        antigos = s.exec(
+            select(ProposalVisibility).where(ProposalVisibility.cpf == cpf_num)
+        ).all()
+
+        for item in antigos:
+            s.delete(item)
+
+        for pid in normalized:
+            s.add(ProposalVisibility(cpf=cpf_num, proposal_id=pid, visible=True))
+
+        s.commit()
+
+    return normalized
 
 class FeegowClient:
     def __init__(self) -> None:
@@ -1115,6 +1181,10 @@ class AdminCreateUserDTO(BaseModel):
     invoice_id: str
     vendedor: Optional[str] = None
 
+class AdminProposalVisibilityDTO(BaseModel):
+    cpf: str
+    proposal_ids: List[str] = []
+
 @app.post("/admin/users")
 def admin_create_user(body: AdminCreateUserDTO, admin: User = Depends(require_admin)):
     cpf = re.sub(r"\D+", "", body.cpf or "")
@@ -1158,14 +1228,75 @@ def admin_list_users(limit: int = Query(50, ge=1, le=200), admin: User = Depends
         data = []
         for u in users:
             invs = s.exec(select(Invoice.invoice_id).where(Invoice.cpf == u.cpf)).all()
+            vis_count = s.exec(
+                select(ProposalVisibility.id).where(ProposalVisibility.cpf == u.cpf)
+            ).all()
+
             data.append({
                 "cpf": u.cpf,
                 "nome": u.nome,
                 "vendedor": u.vendedor,
                 "is_admin": bool(getattr(u, "is_admin", False)),
                 "invoices": invs,
+                "proposal_visibility_configured": bool(vis_count),
             })
         return {"ok": True, "users": data}
+    
+
+@app.get("/admin/users/{cpf}/proposals")
+def admin_user_proposals(cpf: str, admin: User = Depends(require_admin)):
+    cpf_num = re.sub(r"\D+", "", cpf or "")
+    if len(cpf_num) != 11:
+        raise HTTPException(status_code=422, detail="CPF inválido")
+
+    patient_id, nome = feegow.get_patient_by_cpf(cpf_num)
+    if not patient_id:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado no Feegow")
+
+    try:
+        proposals = feegow.get_proposals_by_patient(patient_id)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Erro ao buscar propostas no Feegow: {str(e)}")
+
+    visible_ids = get_visible_proposal_ids(cpf_num)
+    configured = has_visibility_config(cpf_num)
+
+    out = []
+    for p in proposals:
+        pid = str(p.get("proposal_id") or "").strip()
+        out.append({
+            "proposal_id": pid,
+            "proposal_date": p.get("proposal_date"),
+            "valor": p.get("valor", 0),
+            "status": p.get("status"),
+            "itens": p.get("itens", []),
+            "visible": (pid in visible_ids) if configured else True,
+        })
+
+    out.sort(key=lambda x: (x.get("proposal_date") or "", str(x.get("proposal_id") or "")), reverse=True)
+
+    return {
+        "ok": True,
+        "cpf": cpf_num,
+        "nome": nome,
+        "patient_id": patient_id,
+        "configured": configured,
+        "proposals": out,
+    }
+    
+@app.post("/admin/users/proposals-visibility")
+def admin_save_proposals_visibility(body: AdminProposalVisibilityDTO, admin: User = Depends(require_admin)):
+    cpf_num = re.sub(r"\D+", "", body.cpf or "")
+    if len(cpf_num) != 11:
+        raise HTTPException(status_code=422, detail="CPF inválido")
+
+    saved = save_visible_proposals(cpf_num, body.proposal_ids or [])
+
+    return {
+        "ok": True,
+        "cpf": cpf_num,
+        "proposal_ids": saved,
+    }
 
 @app.get("/patient/{patient_id}/summary")
 def summary(
@@ -1186,7 +1317,22 @@ def summary(
     # Propostas reais
     propostas = []
     try:
-        propostas = feegow.get_proposals_by_patient(patient_id,status_filter="executada")
+        propostas = feegow.get_proposals_by_patient(patient_id, status_filter="executada")
+
+        visible_ids = get_visible_proposal_ids(cpf_session)
+        configured = has_visibility_config(cpf_session)
+
+        if configured:
+            propostas = [
+                p for p in propostas
+                if str(p.get("proposal_id") or "").strip() in visible_ids
+            ]
+
+        if debug:
+            dbg = {}
+            dbg["proposal_visibility_configured"] = configured
+            dbg["proposal_visibility_ids"] = sorted(list(visible_ids))
+            dbg["qtd_propostas_apos_filtro"] = len(propostas)
     except httpx.HTTPError as e:
         if debug:
             print("Erro Feegow proposal/list:", e)
