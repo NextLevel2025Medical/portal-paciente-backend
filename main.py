@@ -1449,23 +1449,25 @@ def summary(
         dbg = data.setdefault("_debug", {})
         dbg["qtd_propostas"] = len(propostas)
         dbg["total_propostas"] = total
+    
+        data["agendamentos"] = []
 
     # ======= AGENDAMENTOS (reais, janela curta por padrão) =======
     # ======= AGENDAMENTOS (ano inteiro costurado em janelas <= 180d) =======
-    try:
-        start = date(2020, 1, 1)
-        end   = date(2030, 12, 31)
-        stitched = feegow.get_appointments_range_hydrated(patient_id, start, end)
-        data["agendamentos"] = stitched["items"]  # já vem com nomes traduzidos
-        if debug:
-            data.setdefault("_debug", {})["windows"] = stitched.get("windows", [])
-    except httpx.HTTPError:
-        data["agendamentos"] = []
+    #try:
+    #    start = date(2020, 1, 1)
+    #    end   = date(2030, 12, 31)
+    #    stitched = feegow.get_appointments_range_hydrated(patient_id, start, end)
+    #    data["agendamentos"] = stitched["items"]  # já vem com nomes traduzidos
+    #    if debug:
+    #        data.setdefault("_debug", {})["windows"] = stitched.get("windows", [])
+    #except httpx.HTTPError:
+    #    data["agendamentos"] = []
 
-    if debug:
-        data.setdefault("_debug", {})["qtd_agendamentos"] = len(data.get("agendamentos", []))
+    #if debug:
+    #    data.setdefault("_debug", {})["qtd_agendamentos"] = len(data.get("agendamentos", []))
 
-    return data
+    #return data
 
 @app.get("/me/summary")
 def my_summary(
