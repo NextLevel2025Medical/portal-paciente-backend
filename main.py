@@ -1451,6 +1451,8 @@ def summary(
         dbg["total_propostas"] = total
     
         data["agendamentos"] = []
+    
+    
 
     # ======= AGENDAMENTOS (reais, janela curta por padrão) =======
     # ======= AGENDAMENTOS (ano inteiro costurado em janelas <= 180d) =======
@@ -1467,7 +1469,7 @@ def summary(
     #if debug:
     #    data.setdefault("_debug", {})["qtd_agendamentos"] = len(data.get("agendamentos", []))
 
-    #return data
+    return data
 
 @app.get("/me/summary")
 def my_summary(
